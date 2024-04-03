@@ -31,6 +31,7 @@ from .matcher import build_matcher
 from .deformable_transformer_plus import build_deforamble_transformer, pos2posemb
 from .qim import build as build_query_interaction_layer
 from .memory_bank import build as build_memory_bank
+from .motion_prediction import build as build_motion_prediction
 from .deformable_detr import SetCriterion, MLP, sigmoid_focal_loss
 
 
@@ -400,7 +401,7 @@ def _get_clones(module, N):
 
 class MOTR(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0):
+                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0, motion_prediction=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -494,6 +495,7 @@ class MOTR(nn.Module):
         self.criterion = criterion
         self.memory_bank = memory_bank
         self.mem_bank_len = 0 if memory_bank is None else memory_bank.max_his_length
+        self.motion_prediction = motion_prediction
 
     def _generate_empty_tracks(self, proposals=None):
         track_instances = Instances((1, 1))
@@ -547,6 +549,8 @@ class MOTR(nn.Module):
             (len(track_instances), ), dtype=torch.float32, device=device)
         track_instances.best_features = torch.zeros(
             (len(track_instances), d_model), dtype=torch.float32, device=device)
+        
+        track_instances.tracker = None
 
         return track_instances.to(self.query_embed.weight.device)
 
@@ -684,6 +688,8 @@ class MOTR(nn.Module):
             self.track_base.update(track_instances)
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
+        if self.motion_prediction is not None:
+            track_instances = self.motion_prediction(track_instances)
         tmp = {}
         tmp['track_instances'] = track_instances
         if not is_last:
@@ -785,7 +791,6 @@ class MOTR(nn.Module):
                 frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
-            print(len(track_instances))
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
 
@@ -846,6 +851,11 @@ def build(args):
                 {"frame_{}_track_loss_ce".format(i): args.cls_loss_coef})
     else:
         memory_bank = None
+    
+    if args.predict_box_next_frame:
+        motion_prediction = build_motion_prediction(args)
+    else:
+        motion_prediction = None
     losses = ['labels', 'boxes']
     criterion = ClipMatcher(num_classes, matcher=img_matcher,
                             weight_dict=weight_dict, losses=losses)
@@ -865,5 +875,6 @@ def build(args):
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
         query_denoise=args.query_denoise,
+        motion_prediction=motion_prediction
     )
     return model, criterion, postprocessors
