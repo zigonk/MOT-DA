@@ -852,7 +852,7 @@ def build(args):
     else:
         memory_bank = None
     
-    if args.predict_box_next_frame:
+    if args.motion_pred:
         motion_prediction = build_motion_prediction(args)
     else:
         motion_prediction = None

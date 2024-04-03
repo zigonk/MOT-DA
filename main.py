@@ -190,6 +190,11 @@ def get_args_parser():
                         type=float, default=0.8)
     parser.add_argument('--memory_bank_temporal_gap_regulization', type=float, default=0.0)
 
+    # Motion prediction arguments
+    parser.add_argument('--motion_pred', action='store_true')
+    parser.add_argument('--delta_t', type=int, default=3)
+    parser.add_argument('--is_origin_kalman', action='store_true')
+
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
     parser.add_argument('--query_denoise', type=float, default=0.)
     return parser

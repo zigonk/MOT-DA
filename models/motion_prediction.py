@@ -177,7 +177,6 @@ ASSO_FUNCS = {  "iou": iou_batch,
 class MotionPrediction(object):
     def __init__(self, args):
         self.delta_t = args.delta_t
-        self.inertia = args.inertia
         self.is_origin_kalman = args.is_origin_kalman
     def _update_bbox(self, track_instances: Instances):
         is_none_tracker = track_instances.tracker == None
@@ -187,7 +186,8 @@ class MotionPrediction(object):
         # Update trackers
         for i, tracker in enumerate(track_instances.tracker):
             if tracker is not None:
-                tracker.update(pred_bboxes[i])
+                if (track_instances.scores[i] > 0.5):
+                    tracker.update(pred_bboxes[i])
                 track_instances.pred_boxes[i] = box_ops.box_xyxy_to_cxcywh(tracker.predict())
         # Check if trackers are not initialized
         track_instances.tracker[is_none_tracker] = [KalmanBoxTracker(bbox, delta_t=self.delta_t, 
