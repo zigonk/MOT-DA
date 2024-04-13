@@ -7,15 +7,15 @@
 set -x
 set -o pipefail
 
-
-
-DATA_DIR=DanceTrack
+DATA_DIR=DanceTrack 
 DATA_SPLIT=test
 NUM_GPUS=2
 
-EXP_NAME=tracker_sam_best_feat_selector_by_iou
-args=$(cat configs/motrv2_sam_feat_selector.args)
+EXP_NAME=sam_feat_selector__motion_pred_v3
+args=$(cat configs/motrv2_sam_feat_selector__motion_pred_v3.args)
 python -m torch.distributed.launch --nproc_per_node ${NUM_GPUS} \
-    submit_dance.py ${args} --exp_name outputs/${EXP_NAME}-${DATA_SPLIT} --resume $1 --data_dir ${DATA_DIR}/${DATA_SPLIT} --local_world_size ${NUM_GPUS}
+    submit_dance.py ${args} --exp_name outputs/${EXP_NAME}--${DATA_DIR}-${DATA_SPLIT} \
+    --resume $1 --data_dir ${DATA_DIR}/${DATA_SPLIT} \
+    --local_world_size ${NUM_GPUS}
 
 

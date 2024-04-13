@@ -550,8 +550,7 @@ class MOTR(nn.Module):
         track_instances.best_features = torch.zeros(
             (len(track_instances), d_model), dtype=torch.float32, device=device)
         
-        track_instances.tracker = None
-
+        track_instances.tracker = [None] * len(track_instances)
         return track_instances.to(self.query_embed.weight.device)
 
     def clear(self):
@@ -688,8 +687,6 @@ class MOTR(nn.Module):
             self.track_base.update(track_instances)
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
-        if self.motion_prediction is not None:
-            track_instances = self.motion_prediction(track_instances)
         tmp = {}
         tmp['track_instances'] = track_instances
         if not is_last:
@@ -707,6 +704,8 @@ class MOTR(nn.Module):
         if track_instances is None:
             track_instances = self._generate_empty_tracks(proposals)
         else:
+            if self.motion_prediction is not None:
+                track_instances = self.motion_prediction(track_instances)
             track_instances = Instances.cat([
                 self._generate_empty_tracks(proposals),
                 track_instances])
@@ -750,6 +749,8 @@ class MOTR(nn.Module):
             if track_instances is None:
                 track_instances = self._generate_empty_tracks(proposals)
             else:
+                if self.motion_prediction is not None:
+                    track_instances = self.motion_prediction(track_instances)
                 track_instances = Instances.cat([
                     self._generate_empty_tracks(proposals),
                     track_instances])

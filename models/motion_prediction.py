@@ -4,6 +4,8 @@
 from __future__ import print_function
 
 import numpy as np
+import torch
+import copy
 
 from models.structures.instances import Instances
 from util import box_ops
@@ -56,29 +58,42 @@ def speed_direction(bbox1, bbox2):
     norm = np.sqrt((cy2-cy1)**2 + (cx2-cx1)**2) + 1e-6
     return speed / norm
 
-
-class KalmanBoxTracker(object):
+class KalmanBoxTracker:
     """
     This class represents the internal state of individual tracked objects observed as bbox.
     """
     count = 0
 
-    def __init__(self, bbox, delta_t=3, orig=False):
+    def __init__(self, bbox, delta_t=3, orig=False, dim_x=7):
         """
         Initialises a tracker using initial bounding box.
 
         """
+        self.bbox_scale = 100.0
+        dim_z = 4
         # define constant velocity model
         if not orig:
           from .kalmanfilter import KalmanFilterNew as KalmanFilter
-          self.kf = KalmanFilter(dim_x=7, dim_z=4)
+          self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
         else:
           from filterpy.kalman import KalmanFilter
-          self.kf = KalmanFilter(dim_x=7, dim_z=4)
-        self.kf.F = np.array([[1, 0, 0, 0, 1, 0, 0], [0, 1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 0, 0, 1], [
-                            0, 0, 0, 1, 0, 0, 0],  [0, 0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1]])
-        self.kf.H = np.array([[1, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0],
-                            [0, 0, 1, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]])
+          self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
+        # self.kf.F = np.array([[1, 0, 0, 0, 1, 0, 0], [0, 1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 0, 0, 1], [
+        #                     0, 0, 0, 1, 0, 0, 0],  [0, 0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1]])
+        # self.kf.H = np.array([[1, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0],
+        #                     [0, 0, 1, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0]])
+        self.kf.F = np.zeros((dim_x, dim_x))
+        # Set the state transition matrix values with 1 in the diagonal and 1 in the velocity columns
+        for i in range(dim_x):
+            self.kf.F[i, i] = 1
+            if i+dim_z < dim_x:
+                self.kf.F[i, i+dim_z] = 1
+
+        self.kf.H = np.zeros((4, dim_x))
+        # Set the observation matrix values with 1 in the diagonal
+        for i in range(4):
+            self.kf.H[i, i] = 1
+
 
         self.kf.R[2:, 2:] *= 10.
         self.kf.P[4:, 4:] *= 1000.  # give high uncertainty to the unobservable initial velocities
@@ -110,6 +125,7 @@ class KalmanBoxTracker(object):
         Updates the state vector with observed bbox.
         """
         if bbox is not None:
+            bbox *= self.bbox_scale
             if self.last_observation.sum() >= 0:  # no previous observation
                 previous_box = None
                 for i in range(self.delta_t):
@@ -153,7 +169,9 @@ class KalmanBoxTracker(object):
             self.hit_streak = 0
         self.time_since_update += 1
         self.history.append(convert_x_to_bbox(self.kf.x))
-        return self.history[-1]
+        # Get uncertainty of the prediction
+        std = np.sqrt(np.diag(self.kf.P))
+        return self.history[-1] / self.bbox_scale, std / self.bbox_scale
 
     def get_state(self):
         """
@@ -178,24 +196,67 @@ class MotionPrediction(object):
     def __init__(self, args):
         self.delta_t = args.delta_t
         self.is_origin_kalman = args.is_origin_kalman
+        self.weight_prev_wh = args.weight_prev_wh
+        self.weight_prev_xy = args.weight_prev_xy
+        self.is_adaptive_by_std = args.is_adaptive_by_std
     def _update_bbox(self, track_instances: Instances):
-        is_none_tracker = track_instances.tracker == None
+        device = track_instances.pred_boxes.device
+        is_none_tracker = torch.tensor([tracker is None for tracker in track_instances.tracker]).to(device)
         pred_bboxes = track_instances.pred_boxes.detach().clone()
         # Convert to xyxy
         pred_bboxes = box_ops.box_cxcywh_to_xyxy(pred_bboxes)
         # Update trackers
         for i, tracker in enumerate(track_instances.tracker):
             if tracker is not None:
-                if (track_instances.scores[i] > 0.5):
-                    tracker.update(pred_bboxes[i])
-                track_instances.pred_boxes[i] = box_ops.box_xyxy_to_cxcywh(tracker.predict())
+                if (track_instances.obj_idxes[i] >= 0 and track_instances.scores[i] > 0.5):
+                    # print("Object index:", track_instances.obj_idxes[i])
+                    tracker.update(pred_bboxes[i].cpu().numpy())
+                else:
+                    tracker.update(None)
+
+                predicted_boxes, std = tracker.predict()
+
+                if (track_instances.scores[i] >= 0.5 and tracker.hit_streak > 5):
+                    predicted_boxes = torch.tensor(predicted_boxes).to(device)
+                    # print("History:", tracker.history_observations[-3:])
+                    # print("Predicted boxes:", predicted_boxes)
+                    # print("Std:", std)
+                    # Convert to cxcywh
+                    predicted_boxes = box_ops.box_xyxy_to_cxcywh(predicted_boxes).squeeze(0)
+                    # Get diag of std as uncertainty and only use the first 2 dimensions (x, y)
+                    # # print(std)
+                    # # print(tracker.hits, tracker.hit_streak, tracker.age, tracker.time_since_update)
+                    std_xy = torch.tensor(std[:2]).to(device).clamp(0, 1)
+                    std_r = torch.tensor(std[3:4]).to(device).clamp(0, 1)
+                    # # print(std_xy, std_r)
+                    std_xywh = torch.cat([std_xy, std_r, std_r]).to(device)
+                    # # Only update the center of the box
+                    # # print(track_instances.obj_idxes[i])
+                    # # print(std_xywh)
+                    pred_xy_weight = 1.0 - self.weight_prev_xy
+                    pred_wh_wieght = 1.0 - self.weight_prev_wh
+                    prev_xy_weight = (self.weight_prev_xy + std_xywh[:2] * pred_xy_weight * self.is_adaptive_by_std)
+                    prev_wh_weight = (self.weight_prev_wh + std_xywh[2:] * pred_wh_wieght * self.is_adaptive_by_std)
+                    predicted_boxes[:2] = track_instances.pred_boxes[i][:2] * prev_xy_weight + \
+                                            predicted_boxes[:2] * (1.0 - prev_xy_weight)
+                    predicted_boxes[2:] = track_instances.pred_boxes[i][2:] * prev_wh_weight + \
+                                            predicted_boxes[2:] * (1.0 - prev_wh_weight)
+                    track_instances.ref_pts[i] = predicted_boxes.clamp(0, 1)
+                    # print("-------------------------------")
+        
         # Check if trackers are not initialized
-        track_instances.tracker[is_none_tracker] = [KalmanBoxTracker(bbox, delta_t=self.delta_t, 
-                                                                     orig=self.is_origin_kalman) 
+        new_trackers = [KalmanBoxTracker(bbox.cpu().numpy(), delta_t=self.delta_t, 
+                                                                     orig=self.is_origin_kalman,
+                                                                     dim_x=7) 
                                                                      for bbox in pred_bboxes[is_none_tracker]]
+        # Update trackers
+        for i, tracker in enumerate(track_instances.tracker):
+            if tracker is None:
+                track_instances.tracker[i] = new_trackers.pop(0)
+                track_instances.tracker[i].predict()
         return track_instances
 
-    def __call__(self, track_instances: Instances):
+    def __call__(self, track_instances: Instances) -> Instances:
         track_instances = self._update_bbox(track_instances)
         return track_instances
     

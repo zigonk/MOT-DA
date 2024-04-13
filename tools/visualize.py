@@ -76,11 +76,11 @@ def process(trk_path, img_list, output="output.mp4"):
 
 
 if __name__ == '__main__':
-    METHOD="sam_occlusion_discard-test"
+    METHOD="sam_best_feat_selector_by_iou-val"
     track_dir = "./outputs/tracker_" + METHOD + "/"
     method_name = "motrv2_" + METHOD
     DATASET_NAME = "DanceTrack"
-    DATA_SPLIT = "test"
+    DATA_SPLIT = "val"
     os.makedirs(f'visualize/{method_name}', exist_ok=True)
     jobs = os.listdir(track_dir)
     rank = int(os.environ.get('RLAUNCH_REPLICA', '0'))
@@ -88,7 +88,7 @@ if __name__ == '__main__':
     jobs = sorted(jobs)[rank::ws]
     for seq in jobs:
         print(seq)
-        if (seq != "dancetrack0064.txt"):
+        if (seq != "dancetrack0065.txt"):
             continue
         trk_path = track_dir + seq
         # trk_path = "/data/Dataset/mot/DanceTrack/val/dancetrack0010/gt/gt.txt"

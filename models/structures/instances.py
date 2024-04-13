@@ -149,7 +149,14 @@ class Instances:
 
         ret = Instances(self._image_size)
         for k, v in self._fields.items():
-            ret.set(k, v[item])
+            if type(v) == list:
+                if type(item) == slice:
+                    new_v = v[item]
+                else:
+                    new_v = [v[i] for i, is_get in enumerate(item) if is_get]
+                ret.set(k, new_v)
+            else:
+                ret.set(k, v[item])
         return ret
 
     def __len__(self) -> int:
