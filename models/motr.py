@@ -698,14 +698,14 @@ class MOTR(nn.Module):
         return frame_res
 
     @torch.no_grad()
-    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None):
+    def inference_single_image_old(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
         if track_instances is None:
             track_instances = self._generate_empty_tracks(proposals)
         else:
             if self.motion_prediction is not None:
-                track_instances = self.motion_prediction(track_instances)
+                track_instances = self.motion_prediction(track_instances, flow)
             track_instances = Instances.cat([
                 self._generate_empty_tracks(proposals),
                 track_instances])

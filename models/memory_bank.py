@@ -37,7 +37,7 @@ class SparsenessAwareMemoryModule(MemoryBankBase):
         self.max_frame_gap = args.memory_bank_max_frame_gap
         self.iou_threshold = args.memory_bank_iou_threshold
         self.high_conf_threshold = args.memory_bank_high_conf_threshold
-        self.temporal_gap_regulization = args.memory_bank_temporal_gap_regulization
+        self.temporal_gap_reg = args.memory_bank_temporal_gap_regulization
 
     def _build_layers(self, args, dim_in, hidden_dim, dim_out):
         pass
@@ -50,7 +50,7 @@ class SparsenessAwareMemoryModule(MemoryBankBase):
     def _update_best_features_by_iou(self, track_instances):
         pred_boxes = track_instances.pred_boxes.detach().clone()
         # Increase the best_iou as regularization of temporal gap
-        track_instances.best_iou = track_instances.best_iou.detach().clone() * (1 + self.temporal_gap_regulization)
+        track_instances.best_iou = track_instances.best_iou.detach().clone() * (1 + self.temporal_gap_reg)
         # Convert to xyxy format
         pred_boxes = box_ops.box_cxcywh_to_xyxy(pred_boxes)
 

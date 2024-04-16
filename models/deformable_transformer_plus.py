@@ -203,7 +203,7 @@ class DeformableTransformer(nn.Module):
             avg_mem_bank = mem_bank * (~mem_bank_pad_mask.unsqueeze(-1))
             avg_mem_bank = avg_mem_bank.sum(
                 1) / (~mem_bank_pad_mask).sum(1).unsqueeze(-1)
-            new_tgt = (tgt + avg_mem_bank) / 2
+            new_tgt = (tgt + avg_mem_bank) / 2.
             is_exist_mem = (~mem_bank_pad_mask).any(1)
             tgt = torch.where(is_exist_mem.unsqueeze(-1), new_tgt, tgt)
         # decoder

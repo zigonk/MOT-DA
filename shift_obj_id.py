@@ -1,6 +1,6 @@
 import os
 
-TRACKER_PATH = 'outputs/sam__best_feat_selector--MOT17-images/final'
+TRACKER_PATH = 'outputs/sam_feat_selector__motion_pred_v3--MOT17-images/final'
 
 def shift_obj_id(path, shift):
     with open(path, 'r') as f:

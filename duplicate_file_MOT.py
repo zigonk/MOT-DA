@@ -2,8 +2,8 @@ import os
 import shutil
 from glob import glob
 
-train_pred_dir = 'outputs/sam__best_feat_selector--MOT17-images/test'
-test_pred_dir = 'outputs/sam__best_feat_selector--MOT17-images/train'
+train_pred_dir = 'outputs/sam_feat_selector__motion_pred_v3--MOT17-images/test'
+test_pred_dir = 'outputs/sam_feat_selector__motion_pred_v3--MOT17-images/train'
 final_pred_dir = train_pred_dir.replace('test', 'final')
 os.makedirs(final_pred_dir, exist_ok=True)
 

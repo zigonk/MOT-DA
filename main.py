@@ -197,6 +197,9 @@ def get_args_parser():
     parser.add_argument('--weight_prev_wh', type=float, default=0.0)
     parser.add_argument('--weight_prev_xy', type=float, default=0.0)
     parser.add_argument('--is_adaptive_by_std', action='store_true')
+    parser.add_argument('--is_adaptive_by_flow', action='store_true')
+    parser.add_argument('--motion_adaptive_func', type=str, default='standard_deviation')
+    parser.add_argument('--flow_path', type=str, default='')
 
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
     parser.add_argument('--query_denoise', type=float, default=0.)

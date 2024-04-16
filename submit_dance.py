@@ -21,6 +21,7 @@ from pathlib import Path
 from models import build_model
 from util.tool import load_model
 from main import get_args_parser
+import numpy as np
 
 from models.structures import Instances
 from torch.utils.data import Dataset, DataLoader
@@ -90,6 +91,13 @@ class Detector(object):
 
         self.img_list = sorted(img_list)
         self.img_len = len(self.img_list)
+        dataset_name = '/'.join(vid.split('/')[-3:])
+        
+        vid_flow_path = os.path.join(args.flow_path, dataset_name, 'img1', 'flow.npy')
+        if os.path.exists(vid_flow_path):
+            self.flow = torch.from_numpy(np.load(vid_flow_path))
+        else:
+            self.flow = None
 
         self.predict_path = os.path.join(self.args.output_dir, args.exp_name)
         os.makedirs(self.predict_path, exist_ok=True)
@@ -121,7 +129,7 @@ class Detector(object):
         loader = DataLoader(ListImgDataset(
             self.args.mot_path, self.img_list, det_db), 1, num_workers=2)
         lines = []
-        for i, data in enumerate(tqdm(loader)):
+        for i, data in enumerate(tqdm(loader, desc=self.vid.split('/')[-1])):
             cur_img, ori_img, proposals = [d[0] for d in data]
             cur_img, proposals = cur_img.cuda(), proposals.cuda()
 
@@ -130,9 +138,10 @@ class Detector(object):
                 track_instances.remove('boxes')
                 track_instances.remove('labels')
             seq_h, seq_w, _ = ori_img.shape
-
+            frame_flow = self.flow[i] if self.flow is not None else None
+            frame_flow = frame_flow.to(self.args.device) if frame_flow is not None else None
             res = self.detr.inference_single_image(
-                cur_img, (seq_h, seq_w), track_instances, proposals)
+                cur_img, (seq_h, seq_w), track_instances, proposals, frame_flow)
             track_instances = res['track_instances']
 
             dt_instances = deepcopy(track_instances)
@@ -227,6 +236,7 @@ if __name__ == '__main__':
     if 'seqmap' in seq_nums:
         seq_nums.remove('seqmap')
     vids = [os.path.join(sub_dir, seq) for seq in seq_nums]
+    vids = sorted(vids)
 
     rank = args.local_rank
     ws = args.local_world_size

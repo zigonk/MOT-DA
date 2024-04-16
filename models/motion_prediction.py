@@ -3,12 +3,16 @@
 """
 from __future__ import print_function
 
+import copy
+
 import numpy as np
 import torch
-import copy
+import torchvision
 
 from models.structures.instances import Instances
 from util import box_ops
+from util import motion_adaptive_utils
+
 from .association import *
 
 
@@ -45,10 +49,10 @@ def convert_x_to_bbox(x, score=None):
     """
     w = np.sqrt(x[2] * x[3])
     h = x[2] / w
-    if(score == None):
-      return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2.]).reshape((1, 4))
+    if (score == None):
+        return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2.]).reshape((1, 4))
     else:
-      return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2., score]).reshape((1, 5))
+        return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2., score]).reshape((1, 5))
 
 
 def speed_direction(bbox1, bbox2):
@@ -57,6 +61,59 @@ def speed_direction(bbox1, bbox2):
     speed = np.array([cy2-cy1, cx2-cx1])
     norm = np.sqrt((cy2-cy1)**2 + (cx2-cx1)**2) + 1e-6
     return speed / norm
+
+
+def motion_similarity(cur_flow, cur_bbox, prev_motion):
+    """
+    Optical flow consistency estimation.
+    Args:
+        cur_flow: optical flow from previous frame to current frame
+        cur_bbox: bounding box of the object in the current frame
+        prev_motion: previous motion vector
+    Returns:
+        cos_sim: cosine similarity between the average flow and the previous motion
+    """
+    scale_x = cur_flow.shape[1]
+    scale_y = cur_flow.shape[0] 
+    scale_box = np.array([scale_x, scale_y, scale_x, scale_y])
+    
+    scaled_bbox = (cur_bbox * scale_box).astype(int)
+    # Clamp cur bbox to the image size
+    scaled_bbox[0] = max(0, scaled_bbox[0])
+    scaled_bbox[1] = max(0, scaled_bbox[1])
+    scaled_bbox[2] = min(cur_flow.shape[1], scaled_bbox[2])
+    scaled_bbox[3] = min(cur_flow.shape[0], scaled_bbox[3])
+
+    mask = np.zeros_like(cur_flow[:, :, 0], dtype=bool)
+    mask[scaled_bbox[1]:scaled_bbox[3], scaled_bbox[0]:scaled_bbox[2]] = 1
+    masked_avg_flow = np.mean(cur_flow[mask], axis=0)
+
+    # Compute cosine similarity between the average flow and the previous motion
+    cos_sim = np.dot(masked_avg_flow, prev_motion) / \
+        (np.linalg.norm(masked_avg_flow) * np.linalg.norm(prev_motion))
+    return cos_sim
+
+def motion_matched_ratio(cur_flow, cur_bbox, prev_motion):
+    """Compute ratio of matched motion vectors in the bounding box with the previous motion vector"""
+    scale_x = cur_flow.shape[1]
+    scale_y = cur_flow.shape[0] 
+    scale_box = np.array([scale_x, scale_y, scale_x, scale_y])
+    
+    scaled_bbox = (cur_bbox * scale_box).astype(int)
+    # Clamp cur bbox to the image size
+    scaled_bbox[0] = max(0, scaled_bbox[0])
+    scaled_bbox[1] = max(0, scaled_bbox[1])
+    scaled_bbox[2] = min(cur_flow.shape[1], scaled_bbox[2])
+    scaled_bbox[3] = min(cur_flow.shape[0], scaled_bbox[3])
+
+    mask = np.zeros_like(cur_flow[:, :, 0], dtype=bool)
+    mask[scaled_bbox[1]:scaled_bbox[3], scaled_bbox[0]:scaled_bbox[2]] = 1
+    masked_flow = cur_flow[mask]
+    # Moving flow masked
+    moving_flow = masked_flow[np.linalg.norm(masked_flow, axis=1) > 0.1]
+    # Compute ratio of matched motion vectors
+    matched_ratio = np.sum(np.dot(moving_flow, prev_motion) > 0.5) / len(moving_flow)
+    return matched_ratio
 
 class KalmanBoxTracker:
     """
@@ -73,11 +130,11 @@ class KalmanBoxTracker:
         dim_z = 4
         # define constant velocity model
         if not orig:
-          from .kalmanfilter import KalmanFilterNew as KalmanFilter
-          self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
+            from .kalmanfilter import KalmanFilterNew as KalmanFilter
+            self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
         else:
-          from filterpy.kalman import KalmanFilter
-          self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
+            from filterpy.kalman import KalmanFilter
+            self.kf = KalmanFilter(dim_x=dim_x, dim_z=dim_z)
         # self.kf.F = np.array([[1, 0, 0, 0, 1, 0, 0], [0, 1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 0, 0, 1], [
         #                     0, 0, 0, 1, 0, 0, 0],  [0, 0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 1]])
         # self.kf.H = np.array([[1, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0],
@@ -93,7 +150,6 @@ class KalmanBoxTracker:
         # Set the observation matrix values with 1 in the diagonal
         for i in range(4):
             self.kf.H[i, i] = 1
-
 
         self.kf.R[2:, 2:] *= 10.
         self.kf.P[4:, 4:] *= 1000.  # give high uncertainty to the unobservable initial velocities
@@ -139,7 +195,7 @@ class KalmanBoxTracker:
                   Estimate the track speed direction with observations \Delta t steps away
                 """
                 self.velocity = speed_direction(previous_box, bbox)
-            
+
             """
               Insert new observations. This is a ugly way to maintain both self.observations
               and self.history_observations. Bear it for the moment.
@@ -160,12 +216,12 @@ class KalmanBoxTracker:
         """
         Advances the state vector and returns the predicted bounding box estimate.
         """
-        if((self.kf.x[6]+self.kf.x[2]) <= 0):
+        if ((self.kf.x[6]+self.kf.x[2]) <= 0):
             self.kf.x[6] *= 0.0
 
         self.kf.predict()
         self.age += 1
-        if(self.time_since_update > 0):
+        if (self.time_since_update > 0):
             self.hit_streak = 0
         self.time_since_update += 1
         self.history.append(convert_x_to_bbox(self.kf.x))
@@ -186,11 +242,16 @@ class KalmanBoxTracker:
     that we hardly normalize the cost by all methods to (0,1) which may not be 
     the best practice.
 """
-ASSO_FUNCS = {  "iou": iou_batch,
-                "giou": giou_batch,
-                "ciou": ciou_batch,
-                "diou": diou_batch,
-                "ct_dist": ct_dist}
+ASSO_FUNCS = {"iou": iou_batch,
+              "giou": giou_batch,
+              "ciou": ciou_batch,
+              "diou": diou_batch,
+              "ct_dist": ct_dist}
+
+ADAPTIVE_FUNCS = {"motion_similarity": motion_adaptive_utils.motion_adaptive_by_cosine_similarity,
+                  "motion_matched_ratio": motion_adaptive_utils.motion_adaptive_by_matched_motion_ratio,
+                  "standard_deviation": motion_adaptive_utils.motion_adaptive_by_standard_deviation}
+
 
 class MotionPrediction(object):
     def __init__(self, args):
@@ -199,12 +260,30 @@ class MotionPrediction(object):
         self.weight_prev_wh = args.weight_prev_wh
         self.weight_prev_xy = args.weight_prev_xy
         self.is_adaptive_by_std = args.is_adaptive_by_std
-    def _update_bbox(self, track_instances: Instances):
+        self.is_adaptive_by_flow = args.is_adaptive_by_flow
+        self.motion_adaptive_func = args.motion_adaptive_func
+
+        # Backward compatibility
+        if (self.is_adaptive_by_flow):
+            self.motion_adaptive_func = "motion_similarity"
+        if (self.is_adaptive_by_std):
+            self.motion_adaptive_func = "standard_deviation"
+
+        self.adaptive_func = ADAPTIVE_FUNCS[self.motion_adaptive_func]
+
+    def _update_bbox(self, track_instances: Instances, flow):
         device = track_instances.pred_boxes.device
-        is_none_tracker = torch.tensor([tracker is None for tracker in track_instances.tracker]).to(device)
+        is_none_tracker = torch.tensor(
+            [tracker is None for tracker in track_instances.tracker]).to(device)
         pred_bboxes = track_instances.pred_boxes.detach().clone()
         # Convert to xyxy
         pred_bboxes = box_ops.box_cxcywh_to_xyxy(pred_bboxes)
+        iou_mask = torchvision.ops.box_iou(
+            pred_bboxes, pred_bboxes).to(device)
+        
+        # Remove self iou
+        iou_mask = iou_mask - torch.eye(iou_mask.size(0)).to(device)
+        iou_mask = iou_mask.max(dim=1)[0]
         # Update trackers
         for i, tracker in enumerate(track_instances.tracker):
             if tracker is not None:
@@ -214,41 +293,64 @@ class MotionPrediction(object):
                 else:
                     tracker.update(None)
 
-                predicted_boxes, std = tracker.predict()
+                kf_pred_boxes, std = tracker.predict()
 
                 if (track_instances.scores[i] >= 0.5 and tracker.hit_streak > 5):
-                    predicted_boxes = torch.tensor(predicted_boxes).to(device)
-                    # print("History:", tracker.history_observations[-3:])
-                    # print("Predicted boxes:", predicted_boxes)
-                    # print("Std:", std)
-                    # Convert to cxcywh
-                    predicted_boxes = box_ops.box_xyxy_to_cxcywh(predicted_boxes).squeeze(0)
-                    # Get diag of std as uncertainty and only use the first 2 dimensions (x, y)
-                    # # print(std)
-                    # # print(tracker.hits, tracker.hit_streak, tracker.age, tracker.time_since_update)
+                    kf_pred_boxes = torch.tensor(kf_pred_boxes).to(device)
+                    kf_pred_boxes = box_ops.box_xyxy_to_cxcywh(
+                        kf_pred_boxes).squeeze(0)
+
+                    pred_xy_weight = 1.0 - self.weight_prev_xy
+                    pred_wh_weight = 1.0 - self.weight_prev_wh
                     std_xy = torch.tensor(std[:2]).to(device).clamp(0, 1)
                     std_r = torch.tensor(std[3:4]).to(device).clamp(0, 1)
-                    # # print(std_xy, std_r)
                     std_xywh = torch.cat([std_xy, std_r, std_r]).to(device)
-                    # # Only update the center of the box
-                    # # print(track_instances.obj_idxes[i])
-                    # # print(std_xywh)
-                    pred_xy_weight = 1.0 - self.weight_prev_xy
-                    pred_wh_wieght = 1.0 - self.weight_prev_wh
-                    prev_xy_weight = (self.weight_prev_xy + std_xywh[:2] * pred_xy_weight * self.is_adaptive_by_std)
-                    prev_wh_weight = (self.weight_prev_wh + std_xywh[2:] * pred_wh_wieght * self.is_adaptive_by_std)
-                    predicted_boxes[:2] = track_instances.pred_boxes[i][:2] * prev_xy_weight + \
-                                            predicted_boxes[:2] * (1.0 - prev_xy_weight)
-                    predicted_boxes[2:] = track_instances.pred_boxes[i][2:] * prev_wh_weight + \
-                                            predicted_boxes[2:] * (1.0 - prev_wh_weight)
-                    track_instances.ref_pts[i] = predicted_boxes.clamp(0, 1)
+                    # if (self.is_adaptive_by_std or iou_mask[i] > 0.5):
+                    #     # If the uncertainty is high, we trust the previous prediction
+                    #     prev_xy_weight = (
+                    #         self.weight_prev_xy + std_xywh[:2] * pred_xy_weight)
+                    #     prev_wh_weight = (
+                    #         self.weight_prev_wh + std_xywh[2:] * pred_wh_weight)
+                    # elif (self.is_adaptive_by_flow):
+                    #     motion_sim = motion_similarity(
+                    #         flow, pred_bboxes[i].cpu().numpy(), 
+                    #         (kf_pred_boxes.cpu().numpy() - pred_bboxes[i].cpu().numpy())[:2])
+                    #     # Shift motion sim to 0.5
+                    #     motion_displacement = -motion_sim * 0.5
+                    #     # If the motion is consistent with the previous motion, we trust the prediction of the tracker
+                    #     prev_xy_weight = self.weight_prev_xy + motion_displacement * pred_xy_weight
+                    #     # Motion can't be used to predict the aspect ratio
+                    #     prev_wh_weight = (
+                    #         self.weight_prev_wh + std_xywh[2:] * pred_wh_weight)
+                    # elif (self.is_adaptive_)
+                    # else:
+                    #     prev_xy_weight = self.weight_prev_xy
+                    #     prev_wh_weight = self.weight_prev_wh
+                    if (self.motion_adaptive_func == "standard_deviation"):
+                        adaptive_weight = self.adaptive_func(std_xywh, std_xywh)
+                    else:
+                        adaptive_weight = self.adaptive_func(
+                            flow, pred_bboxes[i], 
+                            (kf_pred_boxes - pred_bboxes[i])[:2], std_xywh)
+                        
+                    prev_xy_weight = self.weight_prev_xy - adaptive_weight[:2] * pred_xy_weight
+                    prev_wh_weight = self.weight_prev_wh - adaptive_weight[2:] * pred_wh_weight
+
+                    kf_pred_boxes[:2] = track_instances.pred_boxes[i][:2] * prev_xy_weight + \
+                        kf_pred_boxes[:2] * (1.0 - prev_xy_weight)
+                    kf_pred_boxes[2:] = track_instances.pred_boxes[i][2:] * prev_wh_weight + \
+                        kf_pred_boxes[2:] * (1.0 - prev_wh_weight)
+
+                    track_instances.ref_pts[i] = kf_pred_boxes.clamp(0, 1)
+                    print("tracker:", i, "pred:", kf_pred_boxes)
+                    # print("tracker:", i, "pred:", kf_pred_boxes)
                     # print("-------------------------------")
-        
+
         # Check if trackers are not initialized
-        new_trackers = [KalmanBoxTracker(bbox.cpu().numpy(), delta_t=self.delta_t, 
-                                                                     orig=self.is_origin_kalman,
-                                                                     dim_x=7) 
-                                                                     for bbox in pred_bboxes[is_none_tracker]]
+        new_trackers = [KalmanBoxTracker(bbox.cpu().numpy(), delta_t=self.delta_t,
+                                         orig=self.is_origin_kalman,
+                                         dim_x=7)
+                        for bbox in pred_bboxes[is_none_tracker]]
         # Update trackers
         for i, tracker in enumerate(track_instances.tracker):
             if tracker is None:
@@ -256,9 +358,10 @@ class MotionPrediction(object):
                 track_instances.tracker[i].predict()
         return track_instances
 
-    def __call__(self, track_instances: Instances) -> Instances:
-        track_instances = self._update_bbox(track_instances)
+    def __call__(self, track_instances: Instances, flow) -> Instances:
+        track_instances = self._update_bbox(track_instances, flow)
         return track_instances
-    
+
+
 def build(args):
     return MotionPrediction(args)
