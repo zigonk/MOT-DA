@@ -652,8 +652,8 @@ class MOTR(nn.Module):
             frame_res['hs'] = frame_res['hs'][:, :n_ins]
             frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
             frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
-            frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
-            frame_res['deform'] = frame_res['deform'][:n_ins]
+            # frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
+            # frame_res['deform'] = frame_res['deform'][:n_ins]
             ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
             for aux_outputs in frame_res['aux_outputs']:
                 ps_outputs.append({
@@ -670,14 +670,15 @@ class MOTR(nn.Module):
                     dim=-1).values
             else:
                 track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
-
+        # print("Track_scores with previous query")
+        # print(track_scores > 0.5)
         track_instances.scores = track_scores
         track_instances.pred_logits = frame_res['pred_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
         track_instances.output_embedding = frame_res['hs'][0]
-        track_instances.frame_idx += 1
-        track_instances.accum_dist += frame_res['mov_dist'][0]
-        track_instances.accum_deform += frame_res['deform'][0]
+        # track_instances.frame_idx += 1
+        # track_instances.accum_dist += frame_res['mov_dist'][0]
+        # track_instances.accum_deform += frame_res['deform'][0]
         if self.training:
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
@@ -696,6 +697,48 @@ class MOTR(nn.Module):
             frame_res['track_instances'] = None
 
         return frame_res
+    
+    def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
+        if self.query_denoise > 0:
+            n_ins = len(track_instances)
+            ps_logits = frame_res['pred_logits'][:, n_ins:]
+            ps_boxes = frame_res['pred_boxes'][:, n_ins:]
+            frame_res['hs'] = frame_res['hs'][:, :n_ins]
+            frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
+            frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
+            frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
+            frame_res['deform'] = frame_res['deform'][:n_ins]
+            ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
+            for aux_outputs in frame_res['aux_outputs']:
+                ps_outputs.append({
+                    'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
+                    'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
+                })
+                aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
+                aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
+            frame_res['ps_outputs'] = ps_outputs
+
+        with torch.no_grad():
+            if self.training:
+                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
+                    dim=-1).values
+            else:
+                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+        print("Track_scores with new query")
+        print(track_scores > 0.5)
+        track_instances.output_embedding = frame_res['hs'][0]
+        track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
+        track_instances.scores = track_scores
+        self.track_base.update(track_instances)
+        tmp = {}
+        tmp['track_instances'] = track_instances
+
+        out_track_instances = self.track_embed(tmp)
+        # Reset obj_idxes to -1 for the new instances.
+        frame_res['track_instances'] = out_track_instances
+        
+        return frame_res
+
 
     @torch.no_grad()
     def inference_single_image_old(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
@@ -709,6 +752,44 @@ class MOTR(nn.Module):
             track_instances = Instances.cat([
                 self._generate_empty_tracks(proposals),
                 track_instances])
+        res = self._forward_single_image(img,
+                                         track_instances=track_instances)
+        res = self._post_process_single_image(res, track_instances, False)
+        track_instances = res['track_instances']
+        track_instances = self.post_process(track_instances, ori_img_size)
+        ret = {'track_instances': track_instances}
+        if 'ref_pts' in res:
+            ref_pts = res['ref_pts']
+            img_h, img_w = ori_img_size
+            scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
+            ref_pts = ref_pts * scale_fct[None]
+            ret['ref_pts'] = ref_pts
+        return ret
+    
+    @torch.no_grad()
+    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
+        if not isinstance(img, NestedTensor):
+            img = nested_tensor_from_tensor_list(img)
+
+        new_track_instances = self._generate_empty_tracks(proposals)
+        res = self._forward_single_image(img,
+                                        track_instances=new_track_instances)
+        res = self._post_process_single_image_for_new_instances(res, new_track_instances)
+
+        if track_instances is None:
+            track_instances = self._generate_empty_tracks(proposals)
+            track_instances.query_pos += res['track_instances'].query_pos
+            track_instances.query_pos /= 2
+        else:
+            if self.motion_prediction is not None:
+                track_instances = self.motion_prediction(track_instances, flow)
+            new_track_instances = self._generate_empty_tracks(proposals)
+            new_track_instances.query_pos += res['track_instances'].query_pos
+            new_track_instances.query_pos /= 2
+            track_instances = Instances.cat([
+                new_track_instances,
+                track_instances])
+        
         res = self._forward_single_image(img,
                                          track_instances=track_instances)
         res = self._post_process_single_image(res, track_instances, False)

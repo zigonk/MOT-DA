@@ -198,14 +198,15 @@ class DeformableTransformer(nn.Module):
             tgt = query_embed.unsqueeze(0).expand(bs, -1, -1)
             reference_points = ref_pts.unsqueeze(0).expand(bs, -1, -1)
             init_reference_out = reference_points
-        # Update tgt by averaging the mem_bank
-        if mem_bank is not None:
-            avg_mem_bank = mem_bank * (~mem_bank_pad_mask.unsqueeze(-1))
-            avg_mem_bank = avg_mem_bank.sum(
-                1) / (~mem_bank_pad_mask).sum(1).unsqueeze(-1)
-            new_tgt = (tgt + avg_mem_bank) / 2.
-            is_exist_mem = (~mem_bank_pad_mask).any(1)
-            tgt = torch.where(is_exist_mem.unsqueeze(-1), new_tgt, tgt)
+        # # Update tgt by averaging the mem_bank
+        # if mem_bank is not None:
+        #     avg_mem_bank = mem_bank * (~mem_bank_pad_mask.unsqueeze(-1))
+        #     avg_mem_bank = avg_mem_bank.sum(
+        #         1) / (~mem_bank_pad_mask).sum(1).unsqueeze(-1)
+        #     new_tgt = (tgt + avg_mem_bank) / 2.
+        #     is_exist_mem = (~mem_bank_pad_mask).any(1)
+        #     print(is_exist_mem.sum())
+        #     tgt = torch.where(is_exist_mem.unsqueeze(-1), new_tgt, tgt)
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory,
                                             spatial_shapes, level_start_index,

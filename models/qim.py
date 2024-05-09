@@ -168,12 +168,12 @@ class QueryInteractionModulev2(QueryInteractionBase):
             query_pos = self.norm_pos(query_pos)
             track_instances.query_pos = query_pos
 
-        query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))
+        query_feat2 = self.linear_feat2(self.dropout_feat1(self.activation(self.linear_feat1(tgt))))    
         query_feat = query_feat + self.dropout_feat2(query_feat2)
         query_feat = self.norm_feat(query_feat)
         track_instances.query_pos[is_pos] = query_feat[is_pos]
-
-        return track_instances
+        
+        return track_instances                                                                                                                                  
 
     def forward(self, data) -> Instances:
         active_track_instances = self._select_active_tracks(data)

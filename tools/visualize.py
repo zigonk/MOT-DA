@@ -62,8 +62,11 @@ def process(trk_path, img_list, output="output.mp4"):
         det_db_key = '/'.join(path.split('/')[3:])
 
         for det in det_db[det_db_key.replace('jpg', 'txt')]:
-            x1, y1, w, h, _ = map(int, map(float, det.strip().split(',')))
-            im = cv2.rectangle(im, (x1, y1), (x1+w, y1+h), (255, 255, 255), 6)
+            x1, y1, w, h, s = map(float, det.strip().split(','))
+            x1, y1, w, h = map(int, (x1, y1, w, h))
+            # im = cv2.rectangle(im, (x1, y1), (x1+w, y1+h), (255, 255, 255), 6)
+            # im = cv2.putText(im, f"{s:.2f}", (x1 + 10, y1 + 30),
+            #                  cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         # for j, x1, y1, x2, y2 in gt_tracklet[i + 1]:
         #     im = cv2.rectangle(im, (x1, y1), (x2, y2), (255, 255, 255), 4)
         #     im = cv2.putText(im, f"{j}", (x1 + 10, y1 + 30),
@@ -78,9 +81,10 @@ def process(trk_path, img_list, output="output.mp4"):
 if __name__ == '__main__':
     DATASET_NAME = "MOT17"
     DATA_SPLIT = "images/test"
-    METHOD="baseline--" + DATASET_NAME + "-" + DATA_SPLIT
+    METHOD_NAME = "motrv2_sam_feat_selector__motion_pred_v3"
+    METHOD= METHOD_NAME + '--' + DATASET_NAME + "-" + DATA_SPLIT
     track_dir = "./outputs/" + METHOD + "/"
-    method_name = "motrv2_" + METHOD
+    method_name = METHOD_NAME
     os.makedirs(f'visualize/{method_name}', exist_ok=True)
     jobs = os.listdir(track_dir)
     rank = int(os.environ.get('RLAUNCH_REPLICA', '0'))
@@ -88,7 +92,7 @@ if __name__ == '__main__':
     jobs = sorted(jobs)[rank::ws]
     for seq in jobs:
         print(seq)
-        # if (seq != "dancetrack0065.txt"):
+        # if (seq != "MOT17-01-SDP.txt"):
         #     continue
         trk_path = track_dir + seq
         # trk_path = "/data/Dataset/mot/DanceTrack/val/dancetrack0010/gt/gt.txt"
