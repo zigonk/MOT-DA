@@ -342,7 +342,7 @@ class MotionPrediction(object):
                         kf_pred_boxes[2:] * (1.0 - prev_wh_weight)
 
                     track_instances.ref_pts[i] = kf_pred_boxes.clamp(0, 1)
-                    print("tracker:", i, "pred:", kf_pred_boxes)
+                    # print("tracker:", i, "pred:", kf_pred_boxes)
                     # print("tracker:", i, "pred:", kf_pred_boxes)
                     # print("-------------------------------")
 

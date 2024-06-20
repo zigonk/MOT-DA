@@ -203,6 +203,7 @@ def get_args_parser():
 
     parser.add_argument('--use_checkpoint', action='store_true', default=False)
     parser.add_argument('--query_denoise', type=float, default=0.)
+    parser.add_argument('--random_drop_rate', type=float, default=0.)
     return parser
 
 

@@ -401,7 +401,8 @@ def _get_clones(module, N):
 
 class MOTR(nn.Module):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0, motion_prediction=None):
+                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0, motion_prediction=None,
+                 random_drop_rate=0.0):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -427,6 +428,7 @@ class MOTR(nn.Module):
         self.position = nn.Embedding(num_queries, 4)
         self.yolox_embed = nn.Embedding(1, hidden_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.random_drop_rate = random_drop_rate
         if query_denoise:
             self.refine_embed = nn.Embedding(1, hidden_dim)
         if num_feature_levels > 1:
@@ -698,50 +700,50 @@ class MOTR(nn.Module):
 
         return frame_res
     
-    def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
-        if self.query_denoise > 0:
-            n_ins = len(track_instances)
-            ps_logits = frame_res['pred_logits'][:, n_ins:]
-            ps_boxes = frame_res['pred_boxes'][:, n_ins:]
-            frame_res['hs'] = frame_res['hs'][:, :n_ins]
-            frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
-            frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
-            frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
-            frame_res['deform'] = frame_res['deform'][:n_ins]
-            ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
-            for aux_outputs in frame_res['aux_outputs']:
-                ps_outputs.append({
-                    'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
-                    'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
-                })
-                aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
-                aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
-            frame_res['ps_outputs'] = ps_outputs
+    # def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
+    #     if self.query_denoise > 0:
+    #         n_ins = len(track_instances)
+    #         ps_logits = frame_res['pred_logits'][:, n_ins:]
+    #         ps_boxes = frame_res['pred_boxes'][:, n_ins:]
+    #         frame_res['hs'] = frame_res['hs'][:, :n_ins]
+    #         frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
+    #         frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
+    #         frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
+    #         frame_res['deform'] = frame_res['deform'][:n_ins]
+    #         ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
+    #         for aux_outputs in frame_res['aux_outputs']:
+    #             ps_outputs.append({
+    #                 'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
+    #                 'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
+    #             })
+    #             aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
+    #             aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
+    #         frame_res['ps_outputs'] = ps_outputs
 
-        with torch.no_grad():
-            if self.training:
-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
-                    dim=-1).values
-            else:
-                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
-        print("Track_scores with new query")
-        print(track_scores > 0.5)
-        track_instances.output_embedding = frame_res['hs'][0]
-        track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
-        track_instances.scores = track_scores
-        self.track_base.update(track_instances)
-        tmp = {}
-        tmp['track_instances'] = track_instances
+    #     with torch.no_grad():
+    #         if self.training:
+    #             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
+    #                 dim=-1).values
+    #         else:
+    #             track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+    #     print("Track_scores with new query")
+    #     print(track_scores > 0.5)
+    #     track_instances.output_embedding = frame_res['hs'][0]
+    #     track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
+    #     track_instances.scores = track_scores
+    #     self.track_base.update(track_instances)
+    #     tmp = {}
+    #     tmp['track_instances'] = track_instances
 
-        out_track_instances = self.track_embed(tmp)
-        # Reset obj_idxes to -1 for the new instances.
-        frame_res['track_instances'] = out_track_instances
+    #     out_track_instances = self.track_embed(tmp)
+    #     # Reset obj_idxes to -1 for the new instances.
+    #     frame_res['track_instances'] = out_track_instances
         
-        return frame_res
+    #     return frame_res
 
 
     @torch.no_grad()
-    def inference_single_image_old(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
+    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
         if track_instances is None:
@@ -766,43 +768,43 @@ class MOTR(nn.Module):
             ret['ref_pts'] = ref_pts
         return ret
     
-    @torch.no_grad()
-    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
-        if not isinstance(img, NestedTensor):
-            img = nested_tensor_from_tensor_list(img)
+    # @torch.no_grad()
+    # def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
+    #     if not isinstance(img, NestedTensor):
+    #         img = nested_tensor_from_tensor_list(img)
 
-        new_track_instances = self._generate_empty_tracks(proposals)
-        res = self._forward_single_image(img,
-                                        track_instances=new_track_instances)
-        res = self._post_process_single_image_for_new_instances(res, new_track_instances)
+    #     new_track_instances = self._generate_empty_tracks(proposals)
+    #     res = self._forward_single_image(img,
+    #                                     track_instances=new_track_instances)
+    #     res = self._post_process_single_image_for_new_instances(res, new_track_instances)
 
-        if track_instances is None:
-            track_instances = self._generate_empty_tracks(proposals)
-            track_instances.query_pos += res['track_instances'].query_pos
-            track_instances.query_pos /= 2
-        else:
-            if self.motion_prediction is not None:
-                track_instances = self.motion_prediction(track_instances, flow)
-            new_track_instances = self._generate_empty_tracks(proposals)
-            new_track_instances.query_pos += res['track_instances'].query_pos
-            new_track_instances.query_pos /= 2
-            track_instances = Instances.cat([
-                new_track_instances,
-                track_instances])
+    #     if track_instances is None:
+    #         track_instances = self._generate_empty_tracks(proposals)
+    #         track_instances.query_pos += res['track_instances'].query_pos
+    #         track_instances.query_pos /= 2
+    #     else:
+    #         if self.motion_prediction is not None:
+    #             track_instances = self.motion_prediction(track_instances, flow)
+    #         new_track_instances = self._generate_empty_tracks(proposals)
+    #         new_track_instances.query_pos += res['track_instances'].query_pos
+    #         new_track_instances.query_pos /= 2
+    #         track_instances = Instances.cat([
+    #             new_track_instances,
+    #             track_instances])
         
-        res = self._forward_single_image(img,
-                                         track_instances=track_instances)
-        res = self._post_process_single_image(res, track_instances, False)
-        track_instances = res['track_instances']
-        track_instances = self.post_process(track_instances, ori_img_size)
-        ret = {'track_instances': track_instances}
-        if 'ref_pts' in res:
-            ref_pts = res['ref_pts']
-            img_h, img_w = ori_img_size
-            scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
-            ref_pts = ref_pts * scale_fct[None]
-            ret['ref_pts'] = ref_pts
-        return ret
+    #     res = self._forward_single_image(img,
+    #                                      track_instances=track_instances)
+    #     res = self._post_process_single_image(res, track_instances, False)
+    #     track_instances = res['track_instances']
+    #     track_instances = self.post_process(track_instances, ori_img_size)
+    #     ret = {'track_instances': track_instances}
+    #     if 'ref_pts' in res:
+    #         ref_pts = res['ref_pts']
+    #         img_h, img_w = ori_img_size
+    #         scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
+    #         ref_pts = ref_pts * scale_fct[None]
+    #         ret['ref_pts'] = ref_pts
+    #     return ret
 
     def forward(self, data: dict):
         if self.training:
@@ -832,6 +834,9 @@ class MOTR(nn.Module):
             else:
                 if self.motion_prediction is not None:
                     track_instances = self.motion_prediction(track_instances)
+                if self.training:
+                    random_select_instances = torch.rand(len(track_instances)) < self.random_drop_rate
+                    track_instances = track_instances[~random_select_instances]
                 track_instances = Instances.cat([
                     self._generate_empty_tracks(proposals),
                     track_instances])
@@ -957,6 +962,7 @@ def build(args):
         memory_bank=memory_bank,
         use_checkpoint=args.use_checkpoint,
         query_denoise=args.query_denoise,
-        motion_prediction=motion_prediction
+        motion_prediction=motion_prediction,
+        random_drop_rate=args.random_drop_rate
     )
     return model, criterion, postprocessors

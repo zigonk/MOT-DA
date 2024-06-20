@@ -1,0 +1,31 @@
+On branch main
+Your branch is ahead of 'origin/main' by 7 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .gitignore
+	modified:   configs/motrv2.args
+	modified:   configs/motrv2_sam_feat_selector__motion_pred_v3.args
+	modified:   configs/motrv2_train_mot17.args
+	modified:   main.py
+	modified:   models/motion_prediction.py
+	modified:   models/motr.py
+	modified:   tools/launch.py
+	modified:   tools/run_dist_launch.sh
+	modified:   tools/simple_inference.sh
+	modified:   tools/train.sh
+	modified:   tools/visualize.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	configs/motrv2_train_mot17_random_drop.args
+	desc
+	download_data.py
+	git_diff
+	git_status
+	git_tag
+	tools/train_rank_1.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")

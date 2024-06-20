@@ -1,0 +1,391 @@
+diff --git a/.gitignore b/.gitignore
+index bff522a..65cc329 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,4 +8,5 @@ build/
+ *.mp4
+ 
+ outputs
+-*det_db*.json
+\ No newline at end of file
++*det_db*.json
++visualize
+\ No newline at end of file
+diff --git a/configs/motrv2.args b/configs/motrv2.args
+index 6e7ec7f..740c7fe 100644
+--- a/configs/motrv2.args
++++ b/configs/motrv2.args
+@@ -20,4 +20,4 @@
+ --append_crowd
+ --det_db det_db_motrv2.json
+ --use_checkpoint
+---mot_path /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/MOT17
+\ No newline at end of file
++--mot_path /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/
+\ No newline at end of file
+diff --git a/configs/motrv2_sam_feat_selector__motion_pred_v3.args b/configs/motrv2_sam_feat_selector__motion_pred_v3.args
+index fef6736..263f58b 100644
+--- a/configs/motrv2_sam_feat_selector__motion_pred_v3.args
++++ b/configs/motrv2_sam_feat_selector__motion_pred_v3.args
+@@ -1,7 +1,7 @@
+ --meta_arch motr
+ --memory_bank_type sam
+ --memory_bank_len 10
+---memory_bank_max_dist 0.2
++--memory_bank_max_dist 0.1
+ --memory_bank_max_frame_gap 10
+ --motion_pred
+ --delta_t 3
+diff --git a/configs/motrv2_train_mot17.args b/configs/motrv2_train_mot17.args
+index a2bdac0..69c44f7 100644
+--- a/configs/motrv2_train_mot17.args
++++ b/configs/motrv2_train_mot17.args
+@@ -21,4 +21,5 @@
+ --det_db det_db_motrv2.json
+ --use_checkpoint
+ --mot_path /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/
+---data_txt_path_train /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/MOT17/detmot17.train
+\ No newline at end of file
++--data_txt_path_train /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/MOT17/detmot17.train
++--save_period 1
+\ No newline at end of file
+diff --git a/main.py b/main.py
+index f9b411b..a82899f 100755
+--- a/main.py
++++ b/main.py
+@@ -203,6 +203,7 @@ def get_args_parser():
+ 
+     parser.add_argument('--use_checkpoint', action='store_true', default=False)
+     parser.add_argument('--query_denoise', type=float, default=0.)
++    parser.add_argument('--random_drop_rate', type=float, default=0.)
+     return parser
+ 
+ 
+diff --git a/models/motion_prediction.py b/models/motion_prediction.py
+index 4c26871..fc16c01 100644
+--- a/models/motion_prediction.py
++++ b/models/motion_prediction.py
+@@ -342,7 +342,7 @@ class MotionPrediction(object):
+                         kf_pred_boxes[2:] * (1.0 - prev_wh_weight)
+ 
+                     track_instances.ref_pts[i] = kf_pred_boxes.clamp(0, 1)
+-                    print("tracker:", i, "pred:", kf_pred_boxes)
++                    # print("tracker:", i, "pred:", kf_pred_boxes)
+                     # print("tracker:", i, "pred:", kf_pred_boxes)
+                     # print("-------------------------------")
+ 
+diff --git a/models/motr.py b/models/motr.py
+index 59c1345..3eb53f3 100644
+--- a/models/motr.py
++++ b/models/motr.py
+@@ -401,7 +401,8 @@ def _get_clones(module, N):
+ 
+ class MOTR(nn.Module):
+     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed,
+-                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0, motion_prediction=None):
++                 aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0, motion_prediction=None,
++                 random_drop_rate=0.0):
+         """ Initializes the model.
+         Parameters:
+             backbone: torch module of the backbone to be used. See backbone.py
+@@ -427,6 +428,7 @@ class MOTR(nn.Module):
+         self.position = nn.Embedding(num_queries, 4)
+         self.yolox_embed = nn.Embedding(1, hidden_dim)
+         self.query_embed = nn.Embedding(num_queries, hidden_dim)
++        self.random_drop_rate = random_drop_rate
+         if query_denoise:
+             self.refine_embed = nn.Embedding(1, hidden_dim)
+         if num_feature_levels > 1:
+@@ -698,50 +700,50 @@ class MOTR(nn.Module):
+ 
+         return frame_res
+     
+-    def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
+-        if self.query_denoise > 0:
+-            n_ins = len(track_instances)
+-            ps_logits = frame_res['pred_logits'][:, n_ins:]
+-            ps_boxes = frame_res['pred_boxes'][:, n_ins:]
+-            frame_res['hs'] = frame_res['hs'][:, :n_ins]
+-            frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
+-            frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
+-            frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
+-            frame_res['deform'] = frame_res['deform'][:n_ins]
+-            ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
+-            for aux_outputs in frame_res['aux_outputs']:
+-                ps_outputs.append({
+-                    'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
+-                    'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
+-                })
+-                aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
+-                aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
+-            frame_res['ps_outputs'] = ps_outputs
+-
+-        with torch.no_grad():
+-            if self.training:
+-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
+-                    dim=-1).values
+-            else:
+-                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+-        print("Track_scores with new query")
+-        print(track_scores > 0.5)
+-        track_instances.output_embedding = frame_res['hs'][0]
+-        track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
+-        track_instances.scores = track_scores
+-        self.track_base.update(track_instances)
+-        tmp = {}
+-        tmp['track_instances'] = track_instances
+-
+-        out_track_instances = self.track_embed(tmp)
+-        # Reset obj_idxes to -1 for the new instances.
+-        frame_res['track_instances'] = out_track_instances
++    # def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
++    #     if self.query_denoise > 0:
++    #         n_ins = len(track_instances)
++    #         ps_logits = frame_res['pred_logits'][:, n_ins:]
++    #         ps_boxes = frame_res['pred_boxes'][:, n_ins:]
++    #         frame_res['hs'] = frame_res['hs'][:, :n_ins]
++    #         frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
++    #         frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
++    #         frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
++    #         frame_res['deform'] = frame_res['deform'][:n_ins]
++    #         ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
++    #         for aux_outputs in frame_res['aux_outputs']:
++    #             ps_outputs.append({
++    #                 'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
++    #                 'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
++    #             })
++    #             aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
++    #             aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
++    #         frame_res['ps_outputs'] = ps_outputs
++
++    #     with torch.no_grad():
++    #         if self.training:
++    #             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
++    #                 dim=-1).values
++    #         else:
++    #             track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
++    #     print("Track_scores with new query")
++    #     print(track_scores > 0.5)
++    #     track_instances.output_embedding = frame_res['hs'][0]
++    #     track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
++    #     track_instances.scores = track_scores
++    #     self.track_base.update(track_instances)
++    #     tmp = {}
++    #     tmp['track_instances'] = track_instances
++
++    #     out_track_instances = self.track_embed(tmp)
++    #     # Reset obj_idxes to -1 for the new instances.
++    #     frame_res['track_instances'] = out_track_instances
+         
+-        return frame_res
++    #     return frame_res
+ 
+ 
+     @torch.no_grad()
+-    def inference_single_image_old(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
++    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
+         if not isinstance(img, NestedTensor):
+             img = nested_tensor_from_tensor_list(img)
+         if track_instances is None:
+@@ -766,43 +768,43 @@ class MOTR(nn.Module):
+             ret['ref_pts'] = ref_pts
+         return ret
+     
+-    @torch.no_grad()
+-    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
+-        if not isinstance(img, NestedTensor):
+-            img = nested_tensor_from_tensor_list(img)
+-
+-        new_track_instances = self._generate_empty_tracks(proposals)
+-        res = self._forward_single_image(img,
+-                                        track_instances=new_track_instances)
+-        res = self._post_process_single_image_for_new_instances(res, new_track_instances)
+-
+-        if track_instances is None:
+-            track_instances = self._generate_empty_tracks(proposals)
+-            track_instances.query_pos += res['track_instances'].query_pos
+-            track_instances.query_pos /= 2
+-        else:
+-            if self.motion_prediction is not None:
+-                track_instances = self.motion_prediction(track_instances, flow)
+-            new_track_instances = self._generate_empty_tracks(proposals)
+-            new_track_instances.query_pos += res['track_instances'].query_pos
+-            new_track_instances.query_pos /= 2
+-            track_instances = Instances.cat([
+-                new_track_instances,
+-                track_instances])
++    # @torch.no_grad()
++    # def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None, flow=None):
++    #     if not isinstance(img, NestedTensor):
++    #         img = nested_tensor_from_tensor_list(img)
++
++    #     new_track_instances = self._generate_empty_tracks(proposals)
++    #     res = self._forward_single_image(img,
++    #                                     track_instances=new_track_instances)
++    #     res = self._post_process_single_image_for_new_instances(res, new_track_instances)
++
++    #     if track_instances is None:
++    #         track_instances = self._generate_empty_tracks(proposals)
++    #         track_instances.query_pos += res['track_instances'].query_pos
++    #         track_instances.query_pos /= 2
++    #     else:
++    #         if self.motion_prediction is not None:
++    #             track_instances = self.motion_prediction(track_instances, flow)
++    #         new_track_instances = self._generate_empty_tracks(proposals)
++    #         new_track_instances.query_pos += res['track_instances'].query_pos
++    #         new_track_instances.query_pos /= 2
++    #         track_instances = Instances.cat([
++    #             new_track_instances,
++    #             track_instances])
+         
+-        res = self._forward_single_image(img,
+-                                         track_instances=track_instances)
+-        res = self._post_process_single_image(res, track_instances, False)
+-        track_instances = res['track_instances']
+-        track_instances = self.post_process(track_instances, ori_img_size)
+-        ret = {'track_instances': track_instances}
+-        if 'ref_pts' in res:
+-            ref_pts = res['ref_pts']
+-            img_h, img_w = ori_img_size
+-            scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
+-            ref_pts = ref_pts * scale_fct[None]
+-            ret['ref_pts'] = ref_pts
+-        return ret
++    #     res = self._forward_single_image(img,
++    #                                      track_instances=track_instances)
++    #     res = self._post_process_single_image(res, track_instances, False)
++    #     track_instances = res['track_instances']
++    #     track_instances = self.post_process(track_instances, ori_img_size)
++    #     ret = {'track_instances': track_instances}
++    #     if 'ref_pts' in res:
++    #         ref_pts = res['ref_pts']
++    #         img_h, img_w = ori_img_size
++    #         scale_fct = torch.Tensor([img_w, img_h]).to(ref_pts)
++    #         ref_pts = ref_pts * scale_fct[None]
++    #         ret['ref_pts'] = ref_pts
++    #     return ret
+ 
+     def forward(self, data: dict):
+         if self.training:
+@@ -832,6 +834,8 @@ class MOTR(nn.Module):
+             else:
+                 if self.motion_prediction is not None:
+                     track_instances = self.motion_prediction(track_instances)
++                random_select_instances = torch.rand(len(track_instances)) < self.random_drop_rate
++                track_instances = track_instances[~random_select_instances]
+                 track_instances = Instances.cat([
+                     self._generate_empty_tracks(proposals),
+                     track_instances])
+@@ -957,6 +961,7 @@ def build(args):
+         memory_bank=memory_bank,
+         use_checkpoint=args.use_checkpoint,
+         query_denoise=args.query_denoise,
+-        motion_prediction=motion_prediction
++        motion_prediction=motion_prediction,
++        random_drop_rate=args.random_drop_rate
+     )
+     return model, criterion, postprocessors
+diff --git a/tools/launch.py b/tools/launch.py
+index c800439..a59fb5a 100755
+--- a/tools/launch.py
++++ b/tools/launch.py
+@@ -171,6 +171,9 @@ def main():
+     current_env["MASTER_PORT"] = str(args.master_port)
+     current_env["WORLD_SIZE"] = str(dist_world_size)
+ 
++    print(args.master_addr)
++    print(args.master_port)
++
+     processes = []
+ 
+     for local_rank in range(0, args.nproc_per_node):
+diff --git a/tools/run_dist_launch.sh b/tools/run_dist_launch.sh
+index 45546d6..712777f 100755
+--- a/tools/run_dist_launch.sh
++++ b/tools/run_dist_launch.sh
+@@ -12,6 +12,10 @@
+ 
+ set -x
+ 
++export NCCL_SOCKET_IFNAME=eth
++export NCCL_DEBUG=INFO
++export GPUS_PER_NODE=1
++
+ GPUS=$1
+ RUN_COMMAND=${@:2}
+ if [ $GPUS -lt 8 ]; then
+@@ -19,8 +23,8 @@ if [ $GPUS -lt 8 ]; then
+ else
+     GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+ fi
+-MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+-MASTER_PORT=${MASTER_PORT:-"29500"}
++MASTER_ADDR=${MASTER_ADDR:-"10.0.1.11"}
++MASTER_PORT=${MASTER_PORT:-"20510"}
+ NODE_RANK=${NODE_RANK:-0}
+ 
+ let "NNODES=GPUS/GPUS_PER_NODE"
+diff --git a/tools/simple_inference.sh b/tools/simple_inference.sh
+index cd7ba30..0996791 100755
+--- a/tools/simple_inference.sh
++++ b/tools/simple_inference.sh
+@@ -9,10 +9,10 @@ set -o pipefail
+ 
+ DATA_DIR=MOT17 
+ DATA_SPLIT=images/test
+-NUM_GPUS=1
++NUM_GPUS=2
+ 
+-EXP_NAME=motrv2_sam_feat_selector__motion_pred_v3
+-args=$(cat configs/motrv2_sam_feat_selector__motion_pred_v3.args)
++EXP_NAME=motrv2_mot17_pretrain
++args=$(cat configs/motrv2.args)
+ python -m torch.distributed.launch --nproc_per_node ${NUM_GPUS} \
+     submit_dance.py ${args} --exp_name outputs/${EXP_NAME}--${DATA_DIR}-${DATA_SPLIT} \
+     --resume $1 --data_dir ${DATA_DIR}/${DATA_SPLIT} \
+diff --git a/tools/train.sh b/tools/train.sh
+index 2f5ee10..f0af310 100755
+--- a/tools/train.sh
++++ b/tools/train.sh
+@@ -10,6 +10,9 @@ PY_ARGS=${@:2}
+ 
+ set -o pipefail
+ 
++export NCCL_SOCKET_IFNAME=eno2
++export NCCL_DEBUG=INFO
++
+ OUTPUT_BASE=$(echo $1 | sed -e "s/configs/exps/g" | sed -e "s/.args$//g")
+ mkdir -p $OUTPUT_BASE
+ 
+@@ -18,7 +21,7 @@ for RUN in $(seq 100); do
+   OUTPUT_DIR=$OUTPUT_BASE/run$RUN
+   mkdir $OUTPUT_DIR && break
+ done
+-
++OUTPUT_DIR=$OUTPUT_BASE/run10
+ # clean up *.pyc files
+ rmpyc() {
+   rm -rf $(find -name __pycache__)
+@@ -51,4 +54,8 @@ git diff > git_diff
+ echo $PY_ARGS > desc
+ echo " ...Done"
+ 
+-python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py ${args} --output_dir . |& tee -a output.log
++python -m torch.distributed.launch \
++  --nproc_per_node=2 --use_env \
++  --nnodes=1 --node_rank=0 \
++  --master_addr=10.0.1.11 --master_port=20501 \
++  main.py ${args} --output_dir . |& tee -a output.log
+diff --git a/tools/visualize.py b/tools/visualize.py
+index 80ff841..f43682c 100644
+--- a/tools/visualize.py
++++ b/tools/visualize.py
+@@ -81,7 +81,7 @@ def process(trk_path, img_list, output="output.mp4"):
+ if __name__ == '__main__':
+     DATASET_NAME = "MOT17"
+     DATA_SPLIT = "images/test"
+-    METHOD_NAME = "motrv2_sam_feat_selector__motion_pred_v3"
++    METHOD_NAME = "motrv2_mot17_pretrain"
+     METHOD= METHOD_NAME + '--' + DATASET_NAME + "-" + DATA_SPLIT
+     track_dir = "./outputs/" + METHOD + "/"
+     method_name = METHOD_NAME

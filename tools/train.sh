@@ -10,6 +10,9 @@ PY_ARGS=${@:2}
 
 set -o pipefail
 
+# export NCCL_SOCKET_IFNAME=eno1
+# export NCCL_DEBUG=INFO
+
 OUTPUT_BASE=$(echo $1 | sed -e "s/configs/exps/g" | sed -e "s/.args$//g")
 mkdir -p $OUTPUT_BASE
 
@@ -18,7 +21,8 @@ for RUN in $(seq 100); do
   OUTPUT_DIR=$OUTPUT_BASE/run$RUN
   mkdir $OUTPUT_DIR && break
 done
-
+# OUTPUT_DIR=$OUTPUT_BASE/run4
+# mkdir $OUTPUT_DIR && break
 # clean up *.pyc files
 rmpyc() {
   rm -rf $(find -name __pycache__)
@@ -51,4 +55,8 @@ git diff > git_diff
 echo $PY_ARGS > desc
 echo " ...Done"
 
-python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py ${args} --output_dir . |& tee -a output.log
+python -m torch.distributed.launch \
+  --nproc_per_node=2 --use_env \
+  --nnodes=1 --node_rank=0 \
+  --master_addr=10.8.9.1 --master_port=1234 \
+  main.py ${args} --output_dir . |& tee -a output.log

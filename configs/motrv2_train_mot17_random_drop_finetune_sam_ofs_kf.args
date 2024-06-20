@@ -1,0 +1,36 @@
+--meta_arch motr
+--dataset_file e2e_mot
+--epoch 20
+--with_box_refine
+--lr_drop 10
+--lr 2e-4
+--lr_backbone 2e-5
+--pretrained /home/nqthuc/Documents/MOT/MOTRv2/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
+--batch_size 1
+--sample_mode random_interval
+--sample_interval 10
+--sampler_lengths 5
+--merger_dropout 0
+--dropout 0
+--random_drop 0.1
+--fp_ratio 0.3
+--query_interaction_layer QIMv2
+--query_denoise 0.05
+--num_queries 10
+--append_crowd
+--det_db det_db_motrv2.json
+--use_checkpoint
+--mot_path /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/
+--data_txt_path_train /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/MOT17/detmot17.train
+--save_period 5
+--random_drop_rate 0.1
+--resume /home/nqthuc/Documents/MOT/MOTRv2/exps/motrv2_train_mot17_random_drop_finetune/run9/checkpoint.pth
+--memory_bank_type sam
+--memory_bank_len 10
+--memory_bank_max_dist 0.1
+--memory_bank_max_frame_gap 10
+--motion_pred
+--delta_t 3
+--weight_prev_wh 0.5
+--weight_prev_xy 0.5
+--is_adaptive_by_std

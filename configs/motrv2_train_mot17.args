@@ -22,3 +22,4 @@
 --use_checkpoint
 --mot_path /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/
 --data_txt_path_train /home/nqthuc/Documents/MOT/MOTRv2/data/Dataset/mot/MOT17/detmot17.train
+--save_period 1

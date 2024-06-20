@@ -171,6 +171,9 @@ def main():
     current_env["MASTER_PORT"] = str(args.master_port)
     current_env["WORLD_SIZE"] = str(dist_world_size)
 
+    print(args.master_addr)
+    print(args.master_port)
+
     processes = []
 
     for local_rank in range(0, args.nproc_per_node):

@@ -9,3 +9,5 @@ build/
 
 outputs
 *det_db*.json
+visualize
+data

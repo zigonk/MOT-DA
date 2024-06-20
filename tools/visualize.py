@@ -81,7 +81,7 @@ def process(trk_path, img_list, output="output.mp4"):
 if __name__ == '__main__':
     DATASET_NAME = "MOT17"
     DATA_SPLIT = "images/test"
-    METHOD_NAME = "motrv2_sam_feat_selector__motion_pred_v3"
+    METHOD_NAME = "motrv2_train_mot17_random_drop_finetune_sam_ofs_kf"
     METHOD= METHOD_NAME + '--' + DATASET_NAME + "-" + DATA_SPLIT
     track_dir = "./outputs/" + METHOD + "/"
     method_name = METHOD_NAME

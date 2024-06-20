@@ -1,7 +1,7 @@
 --meta_arch motr
 --memory_bank_type sam
 --memory_bank_len 10
---memory_bank_max_dist 0.2
+--memory_bank_max_dist 0.1
 --memory_bank_max_frame_gap 10
 --motion_pred
 --delta_t 3
