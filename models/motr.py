@@ -145,6 +145,9 @@ class ClipMatcher(SetCriterion):
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         src_logits = outputs['pred_logits']
+        src_nb_logits = outputs['pred_nb_logits']
+        # Final track scores are calculated by product of classification scores and new-born scores.
+        src_logits = src_logits * src_nb_logits
         idx = self._get_src_permutation_idx(indices)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
@@ -181,7 +184,7 @@ class ClipMatcher(SetCriterion):
 
         return losses
 
-    def match_for_single_frame(self, outputs: dict):
+    def match_for_single_frame(self, outputs: dict, num_dts=0):
         outputs_without_aux = {k: v for k,
                                v in outputs.items() if k != 'aux_outputs'}
 
@@ -196,6 +199,7 @@ class ClipMatcher(SetCriterion):
         obj_idxes = gt_instances_i.obj_ids
         outputs_i = {
             'pred_logits': pred_logits_i.unsqueeze(0),
+            'pred_nb_logits': track_instances.pred_nb_logits.unsqueeze(0),
             'pred_boxes': pred_boxes_i.unsqueeze(0),
         }
 
@@ -241,6 +245,7 @@ class ClipMatcher(SetCriterion):
         # step4. do matching between the unmatched slots and GTs.
         unmatched_outputs = {
             'pred_logits': track_instances.pred_logits[unmatched_track_idxes].unsqueeze(0),
+            'pred_nb_logits': track_instances.pred_nb_logits[unmatched_track_idxes].unsqueeze(0),
             'pred_boxes': track_instances.pred_boxes[unmatched_track_idxes].unsqueeze(0),
         }
         new_matched_indices = match_for_single_decoder_layer(
@@ -284,6 +289,7 @@ class ClipMatcher(SetCriterion):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 unmatched_outputs_layer = {
                     'pred_logits': aux_outputs['pred_logits'][0, unmatched_track_idxes].unsqueeze(0),
+                    'pred_nb_logits': aux_outputs['pred_nb_logits'][0, unmatched_track_idxes].unsqueeze(0),
                     'pred_boxes': aux_outputs['pred_boxes'][0, unmatched_track_idxes].unsqueeze(0),
                 }
                 new_matched_indices_layer = match_for_single_decoder_layer(
@@ -421,6 +427,7 @@ class MOTR(nn.Module):
         hidden_dim = transformer.d_model
         self.num_classes = num_classes
         self.class_embed = nn.Linear(hidden_dim, num_classes)
+        self.class_nb_embed = nn.Linear(hidden_dim, 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         self.use_checkpoint = use_checkpoint
@@ -470,16 +477,30 @@ class MOTR(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
         nn.init.uniform_(self.position.weight.data, 0, 1)
 
+
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
-        num_pred = (transformer.decoder.num_layers +
-                    1) if two_stage else transformer.decoder.num_layers
+        num_pred = (transformer.track_decoder.num_layers + transformer.cross_attn_decoder.num_layers +
+                    1) if two_stage else (transformer.track_decoder.num_layers + transformer.cross_attn_decoder.num_layers)
+        assert with_box_refine, "Currently only support with_box_refine=True"
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
-            self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
+            self.class_nb_embed = _get_clones(self.class_nb_embed, num_pred)
+            self.detection_bbox_embed = _get_clones(self.bbox_embed, num_pred)
+            self.track_bbox_embed = _get_clones(self.bbox_embed, num_pred)
+            self.cross_bbox_embed = _get_clones(self.bbox_embed, num_pred)
+
             nn.init.constant_(
-                self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+                self.detection_bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            nn.init.constant_(
+                self.track_bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            nn.init.constant_(
+                self.cross_bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            
             # hack implementation for iterative bounding box refinement
-            self.transformer.decoder.bbox_embed = self.bbox_embed
+            self.transformer.detect_decoder.bbox_embed = self.detection_bbox_embed
+            self.transformer.track_decoder.bbox_embed = self.track_bbox_embed
+            self.transformer.cross_attn_decoder.bbox_embed = self.cross_bbox_embed
+
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList(
@@ -527,8 +548,10 @@ class MOTR(nn.Module):
             (len(track_instances),), dtype=torch.float, device=device)
         track_instances.pred_boxes = torch.zeros(
             (len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_logits = torch.zeros(
+        track_instances.pred_class_logits = torch.zeros(
             (len(track_instances), self.num_classes), dtype=torch.float, device=device)
+        track_instances.pred_class_logits_nb = torch.zeros(
+            (len(track_instances), 1), dtype=torch.float, device=device)
 
         track_instances.frame_idx = torch.zeros(
             (len(track_instances),), dtype=torch.long, device=device)
@@ -559,12 +582,74 @@ class MOTR(nn.Module):
         self.track_base.clear()
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_class_nb, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, }
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return [{'pred_class_logits': a,
+                'pred_class_logits_nb': b,
+                'pred_boxes': c} for a, b, c in zip(outputs_class, outputs_class_nb, outputs_coord)]
+
+    def _process_transformer_outputs(self, hs, inter_references, cross_hs, cross_inter_references, init_reference, is_predict_new_born=False):
+        outputs_classes = []
+        outputs_classes_nb = []
+        outputs_coords = []
+        print("Log shape")
+        print(hs.shape, cross_hs.shape)
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.class_embed[lvl](hs[lvl])
+            if is_predict_new_born:
+                outputs_class_nb = self.class_nb_embed[lvl](hs[lvl])
+            else:
+                # Same shape of outputs_class but last dimension is 1
+                outputs_class_nb = torch.ones_like(outputs_class[..., :1])
+
+            if is_predict_new_born:
+                tmp = self.detection_bbox_embed[lvl](hs[lvl])
+            else:
+                tmp = self.track_bbox_embed[lvl](hs[lvl])
+            
+            print(reference.shape, tmp.shape)
+
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_classes.append(outputs_class)
+            outputs_classes_nb.append(outputs_class_nb)
+            outputs_coords.append(outputs_coord)
+        
+        for lvl in range(cross_hs.shape[0]):
+            if lvl == 0:
+                reference = outputs_coords[-1]
+            else:
+                reference = cross_inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.class_embed[lvl](cross_hs[lvl])
+            if is_predict_new_born:
+                outputs_class_nb = self.class_nb_embed[lvl](cross_hs[lvl])
+            else:
+                outputs_class_nb = torch.ones_like(outputs_class[..., :1])
+            tmp = self.cross_bbox_embed[lvl](cross_hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(outputs_coord)
+            outputs_classes_nb.append(outputs_class_nb)
+
+        return torch.stack(outputs_classes), torch.stack(outputs_classes_nb), torch.stack(outputs_coords)
+        
 
     def _forward_single_image(self, samples, track_instances: Instances, gtboxes=None):
         features, pos = self.backbone(samples)
@@ -607,75 +692,89 @@ class MOTR(nn.Module):
             ref_pts = track_instances.ref_pts
             attn_mask = None
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+        num_dts = torch.sum(track_instances.obj_idxes == -1)
+        dec_outputs = \
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
-                             mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
+                             mem_bank=track_instances.mem_bank, 
+                             mem_bank_pad_mask=track_instances.mem_padding_mask, 
+                             attn_mask=attn_mask, num_dts=num_dts)
+        
+        
+        detect_outputs = self._process_transformer_outputs(dec_outputs['hs_detect'],
+                                                           dec_outputs['inter_detect_references'],
+                                                           dec_outputs['cross_hs_detect'],
+                                                           dec_outputs['cross_inter_detect_references'],
+                                                           dec_outputs['init_detect_reference'], is_predict_new_born=True)
+        track_outputs = self._process_transformer_outputs(dec_outputs['hs_track'],
+                                                            dec_outputs['inter_track_references'],
+                                                            dec_outputs['cross_hs_track'],
+                                                            dec_outputs['cross_inter_track_references'],
+                                                            dec_outputs['init_track_reference'], is_predict_new_born=False)
+        
 
-        outputs_classes = []
-        outputs_coords = []
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[lvl](hs[lvl])
-            tmp = self.bbox_embed[lvl](hs[lvl])
-            if reference.shape[-1] == 4:
-                tmp += reference
-            else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
-        outputs_class = torch.stack(outputs_classes)
-        outputs_coord = torch.stack(outputs_coords)
 
-        out = {'pred_logits': outputs_class[-1],
-               'pred_boxes': outputs_coord[-1]}
+        out = {'track_outputs': track_outputs, 'detect_outputs': detect_outputs}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(
-                outputs_class, outputs_coord)
-        out['hs'] = hs[-1]
-        last_center = outputs_coord[-1][..., :2]
-        init_center = outputs_coord[0][..., :2]
-        last_wh_ratio = outputs_coord[-1][..., 2] / (outputs_coord[-1][..., 3] + 1e-6)
-        init_wh_ratio = outputs_coord[0][..., 2] / (outputs_coord[0][..., 3] + 1e-6)
-        out['mov_dist'] = torch.norm(last_center - init_center, dim=-1)
-        out['deform'] = abs(last_wh_ratio - init_wh_ratio)
+            out['detect_aux_outputs'] = self._set_aux_loss(
+                detect_outputs[0], detect_outputs[1], detect_outputs[2])
+                
+            out['track_aux_outputs'] = self._set_aux_loss(
+                track_outputs[0], track_outputs[1], track_outputs[2])
+        out['hs_detect'] = dec_outputs['hs_detect']
+        out['cross_hs_detect'] = dec_outputs['cross_hs_detect']
+        out['hs_track'] = dec_outputs['hs_track']
+        out['cross_hs_track'] = dec_outputs['cross_hs_track']
+        out['pred_class_logits'] = torch.cat([out['detect_outputs'][0], out['track_outputs'][0]], dim=2)
+        out['pred_nb_logits'] = torch.cat([out['detect_outputs'][1], out['track_outputs'][1]], dim=2)
+        out['pred_boxes'] = torch.cat([out['detect_outputs'][2], out['track_outputs'][2]], dim=2)
+        out['hs'] = torch.cat([out['hs_detect'], out['hs_track']], dim=2)
+        out['cross_hs'] = torch.cat([out['cross_hs_detect'], out['cross_hs_track']], dim=2)
+        # out['hs'] = hs[-1]
+        # last_center = outputs_coord[-1][..., :2]
+        # init_center = outputs_coord[0][..., :2]
+        # last_wh_ratio = outputs_coord[-1][..., 2] / (outputs_coord[-1][..., 3] + 1e-6)
+        # init_wh_ratio = outputs_coord[0][..., 2] / (outputs_coord[0][..., 3] + 1e-6)
+        # out['mov_dist'] = torch.norm(last_center - init_center, dim=-1)
+        # out['deform'] = abs(last_wh_ratio - init_wh_ratio)
         return out
 
-    def _post_process_single_image(self, frame_res, track_instances, is_last):
-        if self.query_denoise > 0:
-            n_ins = len(track_instances)
-            ps_logits = frame_res['pred_logits'][:, n_ins:]
-            ps_boxes = frame_res['pred_boxes'][:, n_ins:]
-            frame_res['hs'] = frame_res['hs'][:, :n_ins]
-            frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
-            frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
-            # frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
-            # frame_res['deform'] = frame_res['deform'][:n_ins]
-            ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
-            for aux_outputs in frame_res['aux_outputs']:
-                ps_outputs.append({
-                    'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
-                    'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
-                })
-                aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
-                aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
-            frame_res['ps_outputs'] = ps_outputs
+    def _post_process_single_image(self, frame_res, track_instances, is_last, num_dts=0):
+        # if self.query_denoise > 0:
+        #     n_ins = len(track_instances)
+        #     ps_logits = frame_res['pred_logits'][:, n_ins:]
+        #     ps_boxes = frame_res['pred_boxes'][:, n_ins:]
+        #     frame_res['hs'] = frame_res['hs'][:, :n_ins]
+        #     frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
+        #     frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
+        #     # frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
+        #     # frame_res['deform'] = frame_res['deform'][:n_ins]
+        #     ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
+        #     for aux_outputs in frame_res['aux_outputs']:
+        #         ps_outputs.append({
+        #             'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
+        #             'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
+        #         })
+        #         aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
+        #         aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
+        #     frame_res['ps_outputs'] = ps_outputs
+        # else:
+        assert self.query_denoise == 0, "Not implemented yet."
+
+        print(frame_res['pred_class_logits'].shape)
+        print(frame_res['pred_nb_logits'].shape)
 
         with torch.no_grad():
             if self.training:
-                track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
-                    dim=-1).values
+                # track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
+                #     dim=-1).values
+                track_scores = frame_res['pred_class_logits'][0, 0, :].sigmoid() * frame_res['pred_nb_logits'][0, :].sigmoid()
             else:
-                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+                track_scores = frame_res['pred_class_logits'][0, :, 0].sigmoid()
         # print("Track_scores with previous query")
         # print(track_scores > 0.5)
         track_instances.scores = track_scores
-        track_instances.pred_logits = frame_res['pred_logits'][0]
+        track_instances.pred_logits = frame_res['pred_class_logits'][0]
+        track_instances.pred_nb_logits = frame_res['pred_nb_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
         track_instances.output_embedding = frame_res['hs'][0]
         # track_instances.frame_idx += 1
@@ -684,7 +783,7 @@ class MOTR(nn.Module):
         if self.training:
             # the track id will be assigned by the mather.
             frame_res['track_instances'] = track_instances
-            track_instances = self.criterion.match_for_single_frame(frame_res)
+            track_instances = self.criterion.match_for_single_frame(frame_res, num_dts)
         else:
             # each track will be assigned an unique global id by the track base.
             self.track_base.update(track_instances)
@@ -699,47 +798,6 @@ class MOTR(nn.Module):
             frame_res['track_instances'] = None
 
         return frame_res
-    
-    # def _post_process_single_image_for_new_instances(self, frame_res, track_instances):
-    #     if self.query_denoise > 0:
-    #         n_ins = len(track_instances)
-    #         ps_logits = frame_res['pred_logits'][:, n_ins:]
-    #         ps_boxes = frame_res['pred_boxes'][:, n_ins:]
-    #         frame_res['hs'] = frame_res['hs'][:, :n_ins]
-    #         frame_res['pred_logits'] = frame_res['pred_logits'][:, :n_ins]
-    #         frame_res['pred_boxes'] = frame_res['pred_boxes'][:, :n_ins]
-    #         frame_res['mov_dist'] = frame_res['mov_dist'][:n_ins]
-    #         frame_res['deform'] = frame_res['deform'][:n_ins]
-    #         ps_outputs = [{'pred_logits': ps_logits, 'pred_boxes': ps_boxes}]
-    #         for aux_outputs in frame_res['aux_outputs']:
-    #             ps_outputs.append({
-    #                 'pred_logits': aux_outputs['pred_logits'][:, n_ins:],
-    #                 'pred_boxes': aux_outputs['pred_boxes'][:, n_ins:],
-    #             })
-    #             aux_outputs['pred_logits'] = aux_outputs['pred_logits'][:, :n_ins]
-    #             aux_outputs['pred_boxes'] = aux_outputs['pred_boxes'][:, :n_ins]
-    #         frame_res['ps_outputs'] = ps_outputs
-
-    #     with torch.no_grad():
-    #         if self.training:
-    #             track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
-    #                 dim=-1).values
-    #         else:
-    #             track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
-    #     print("Track_scores with new query")
-    #     print(track_scores > 0.5)
-    #     track_instances.output_embedding = frame_res['hs'][0]
-    #     track_instances.obj_idxes = torch.zeros_like(track_instances.obj_idxes)
-    #     track_instances.scores = track_scores
-    #     self.track_base.update(track_instances)
-    #     tmp = {}
-    #     tmp['track_instances'] = track_instances
-
-    #     out_track_instances = self.track_embed(tmp)
-    #     # Reset obj_idxes to -1 for the new instances.
-    #     frame_res['track_instances'] = out_track_instances
-        
-    #     return frame_res
 
 
     @torch.no_grad()
@@ -811,7 +869,8 @@ class MOTR(nn.Module):
             self.criterion.initialize_for_single_clip(data['gt_instances'])
         frames = data['imgs']  # list of Tensor.
         outputs = {
-            'pred_logits': [],
+            'pred_class_logits': [],
+            'pred_nb_logits': [],
             'pred_boxes': [],
         }
         track_instances = None
@@ -847,12 +906,16 @@ class MOTR(nn.Module):
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
                     frame_res = self._forward_single_image(frame, tmp, gtboxes)
                     return (
-                        frame_res['pred_logits'],
+                        frame_res['pred_class_logits'],
+                        frame_res['pred_nb_logits'],
                         frame_res['pred_boxes'],
                         frame_res['hs'],
-                        *[aux['pred_logits']
-                            for aux in frame_res['aux_outputs']],
-                        *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
+                        frame_res['cross_hs'],
+                        # *[aux['pred_class_logits']
+                        #     for aux in frame_res['aux_outputs']],
+                        # *[aux['pred_nb_logits']
+                        #     for aux in frame_res['aux_outputs']],
+                        # *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
 
                 args = [frame, gtboxes] + \
@@ -862,13 +925,16 @@ class MOTR(nn.Module):
                 tmp = checkpoint.CheckpointFunction.apply(
                     fn, len(args), *args, *params)
                 frame_res = {
-                    'pred_logits': tmp[0],
-                    'pred_boxes': tmp[1],
-                    'hs': tmp[2],
-                    'aux_outputs': [{
-                        'pred_logits': tmp[3+i],
-                        'pred_boxes': tmp[3+5+i],
-                    } for i in range(5)],
+                    'pred_class_logits': tmp[0],
+                    'pred_nb_logits': tmp[1],
+                    'pred_boxes': tmp[2],
+                    'hs': tmp[3],
+                    'cross_hs': tmp[4],
+                    # 'aux_outputs': [{
+                    #     'pred_class_logits': tmp[5 + i],
+                    #     'pred_nb_logits': tmp[5 + len(args) + i],
+                    #     'pred_boxes': tmp[5 + 2 * len(args) + i],
+                    # } for i in range(len(tmp) - 5 - 2 * len(args))]
                 }
             else:
                 frame = nested_tensor_from_tensor_list([frame])
@@ -878,7 +944,8 @@ class MOTR(nn.Module):
                 frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
-            outputs['pred_logits'].append(frame_res['pred_logits'])
+            outputs['pred_class_logits'].append(frame_res['pred_class_logits'])
+            outputs['pred_nb_logits'].append(frame_res['pred_nb_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
 
         if not self.training:

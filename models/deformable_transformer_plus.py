@@ -27,7 +27,8 @@ from models.ops.modules import MSDeformAttn
 
 class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
-                 num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
+                 num_encoder_layers=6, num_decoder_layers=6, num_cross_attn_layers=6,
+                 dim_feedforward=1024, dropout=0.1, num_ps_new_born=10,
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300, decoder_self_cross=True, sigmoid_attn=False,
@@ -52,11 +53,24 @@ class DeformableTransformer(nn.Module):
                                                           num_feature_levels, nhead, dec_n_points, decoder_self_cross,
                                                           sigmoid_attn=sigmoid_attn, extra_track_attn=extra_track_attn,
                                                           memory_bank=memory_bank)
-        self.decoder = DeformableTransformerDecoder(
+        self.track_decoder = DeformableTransformerDecoder(
             decoder_layer, num_decoder_layers, return_intermediate_dec)
+        self.detect_decoder = DeformableTransformerDecoder(
+            decoder_layer, num_decoder_layers, return_intermediate_dec)
+        
+        cross_decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation)
+        self.cross_attn_decoder = CrossAttentionDecoder(cross_decoder_layer, num_cross_attn_layers, return_intermediate=return_intermediate_dec)
+
+        self.track_embedding = nn.Parameter(torch.Tensor(1, d_model))
+        self.detect_embedding = nn.Parameter(torch.Tensor(1, d_model))
+        self.reference_points = nn.Parameter(torch.Tensor(1, 4))
+        self.return_intermediate_dec = return_intermediate_dec
 
         self.level_embed = nn.Parameter(
             torch.Tensor(num_feature_levels, d_model))
+        
+        self.new_born_embed = nn.Parameter(torch.Tensor(1, d_model))
+        self.num_ps_new_born = num_ps_new_born
 
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
@@ -74,6 +88,9 @@ class DeformableTransformer(nn.Module):
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
         normal_(self.level_embed)
+        normal_(self.new_born_embed)
+        normal_(self.track_embedding)
+        normal_(self.detect_embedding)
 
     def get_proposal_pos_embed(self, proposals):
         num_pos_feats = 128
@@ -140,7 +157,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None, mem_bank=None, mem_bank_pad_mask=None, attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, ref_pts=None, mem_bank=None, mem_bank_pad_mask=None, attn_mask=None, num_dts=0):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -171,33 +188,35 @@ class DeformableTransformer(nn.Module):
         # encoder
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index,
                               valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+
         # prepare input for decoder
         bs, _, c = memory.shape
-        if self.two_stage:
-            output_memory, output_proposals = self.gen_encoder_output_proposals(
-                memory, mask_flatten, spatial_shapes)
+        # if self.two_stage:
+        #     output_memory, output_proposals = self.gen_encoder_output_proposals(
+        #         memory, mask_flatten, spatial_shapes)
 
-            # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](
-                output_memory)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](
-                output_memory) + output_proposals
+        #     # hack implementation for two-stage Deformable DETR
+        #     enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](
+        #         output_memory)
+        #     enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](
+        #         output_memory) + output_proposals
 
-            topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(
-                enc_outputs_class[..., 0], topk, dim=1)[1]
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
-            topk_coords_unact = topk_coords_unact.detach()
-            reference_points = topk_coords_unact.sigmoid()
-            init_reference_out = reference_points
-            pos_trans_out = self.pos_trans_norm(self.pos_trans(
-                self.get_proposal_pos_embed(topk_coords_unact)))
-            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
-        else:
-            tgt = query_embed.unsqueeze(0).expand(bs, -1, -1)
-            reference_points = ref_pts.unsqueeze(0).expand(bs, -1, -1)
-            init_reference_out = reference_points
+        #     topk = self.two_stage_num_proposals
+        #     topk_proposals = torch.topk(
+        #         enc_outputs_class[..., 0], topk, dim=1)[1]
+        #     topk_coords_unact = torch.gather(
+        #         enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+        #     topk_coords_unact = topk_coords_unact.detach()
+        #     reference_points = topk_coords_unact.sigmoid()
+        #     init_reference_out = reference_points
+        #     pos_trans_out = self.pos_trans_norm(self.pos_trans(
+        #         self.get_proposal_pos_embed(topk_coords_unact)))
+        #     query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+        # else:
+        tgt = query_embed.unsqueeze(0).expand(bs, -1, -1)
+        reference_points = ref_pts.unsqueeze(0).expand(bs, -1, -1)
+        init_reference_out = reference_points
+
         # # Update tgt by averaging the mem_bank
         # if mem_bank is not None:
         #     avg_mem_bank = mem_bank * (~mem_bank_pad_mask.unsqueeze(-1))
@@ -208,16 +227,89 @@ class DeformableTransformer(nn.Module):
         #     print(is_exist_mem.sum())
         #     tgt = torch.where(is_exist_mem.unsqueeze(-1), new_tgt, tgt)
         # decoder
-        hs, inter_references = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index,
-                                            valid_ratios, mask_flatten,
-                                            mem_bank, mem_bank_pad_mask, attn_mask)
+        detect_tgt, detect_reference_points = tgt[:, :num_dts], reference_points[:, :num_dts]
+        track_tgt, track_reference_points = tgt[:, num_dts:], reference_points[:, num_dts:]
+        
+        detect_tgt = torch.cat([self.detect_embedding.expand(detect_tgt.shape[0], 1, -1), detect_tgt], 1)
+        track_tgt = torch.cat([self.track_embedding.expand(track_tgt.shape[0], 1, -1), track_tgt], 1)
+        detect_reference_points = torch.cat([self.reference_points.expand(detect_reference_points.shape[0], 1, -1), detect_reference_points], 1)
+        track_reference_points = torch.cat([self.reference_points.expand(track_reference_points.shape[0], 1, -1), track_reference_points], 1)
+    
 
-        inter_references_out = inter_references
-        if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, None, None
 
+        hs_detect, inter_detect_references = self.detect_decoder(detect_tgt, detect_reference_points, memory,
+                                                                    spatial_shapes, level_start_index,
+                                                                    valid_ratios, mask_flatten,
+                                                                    mem_bank, mem_bank_pad_mask, attn_mask)
+        hs_track, inter_track_references = self.track_decoder(track_tgt, track_reference_points, memory,
+                                                                spatial_shapes, level_start_index,
+                                                                valid_ratios, mask_flatten,
+                                                                mem_bank, mem_bank_pad_mask, attn_mask)
+        
+        if self.return_intermediate_dec:
+            last_hs_detect = hs_detect[-1]
+            last_hs_track = hs_track[-1]
+            last_inter_detect_references = inter_detect_references[-1]
+            last_inter_track_references = inter_track_references[-1]
+        
+        if self.num_ps_new_born > 0:
+            last_hs_track_with_new_born = torch.cat([last_hs_track, self.new_born_embed.expand(last_hs_track.shape[0], self.num_ps_new_born, -1)], 1)
+            last_inter_track_references_with_new_born = torch.cat([last_inter_track_references, torch.zeros(last_inter_track_references.shape[0], self.num_ps_new_born, last_inter_track_references.shape[-1], device=last_inter_track_references.device)], 1)
+        else:    
+            last_hs_track_with_new_born = last_hs_track
+            last_inter_track_references_with_new_born = last_inter_track_references
+
+        cross_hs_detect, cross_hs_track, cross_inter_detect_references, cross_inter_track_references = self.cross_attn_decoder(last_hs_detect, last_hs_track_with_new_born,
+                                                                                                        tgt1_mask=None, tgt2_mask=None,
+                                                                                                        tgt1_key_padding_mask=None, tgt2_key_padding_mask=None,
+                                                                                                        tgt1_reference_points=last_inter_detect_references, 
+                                                                                                        tgt2_reference_points=last_inter_track_references_with_new_born,
+                                                                                                        num_tgt1=last_hs_detect.shape[1], num_tgt2=last_hs_track.shape[1],
+                                                                                                        pos1=None, pos2=None)
+
+        # Remove the first token
+        if self.return_intermediate_dec:
+            hs_detect = hs_detect[:,:, 1:]
+            hs_track = hs_track[:,:, 1:]
+            inter_detect_references = inter_detect_references[:,:, 1:]
+            inter_track_references = inter_track_references[:,:, 1:]
+            cross_hs_detect = cross_hs_detect[:,:, 1:]
+            cross_hs_track = cross_hs_track[:,:, 1:hs_track.shape[2]]
+            cross_inter_detect_references = cross_inter_detect_references[:,:, 1:]
+            cross_inter_track_references = cross_inter_track_references[:,:, 1:hs_track.shape[2]]
+        else:
+            hs_detect = hs_detect[:, 1:]
+            hs_track = hs_track[:, 1:]
+            inter_detect_references = inter_detect_references[:, 1:]
+            inter_track_references = inter_track_references[:, 1:]
+            cross_hs_detect = cross_hs_detect[:, 1:]
+            cross_hs_track = cross_hs_track[:, 1:]
+            cross_inter_detect_references = cross_inter_detect_references[:, 1:]
+            cross_inter_track_references = cross_inter_track_references[:, 1:]
+
+        print(hs_detect.shape, hs_track.shape, inter_detect_references.shape, inter_track_references.shape, cross_hs_detect.shape, cross_hs_track.shape, cross_inter_detect_references.shape, cross_inter_track_references.shape)
+
+
+        # hs, inter_references = self.track_decoder(tgt, reference_points, memory,
+        #                                     spatial_shapes, level_start_index,
+        #                                     valid_ratios, mask_flatten,
+        #                                     mem_bank, mem_bank_pad_mask, attn_mask)
+
+        # inter_references_out = inter_references
+        # if self.two_stage:
+        #     return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+        return {
+            'hs_detect': hs_detect,
+            'hs_track': hs_track,
+            'inter_detect_references': inter_detect_references,
+            'inter_track_references': inter_track_references,
+            'cross_hs_detect': cross_hs_detect,
+            'cross_hs_track': cross_hs_track,
+            'cross_inter_detect_references': cross_inter_detect_references,
+            'cross_inter_track_references': cross_inter_track_references,
+            'init_detect_reference': init_reference_out[:, :num_dts],
+            'init_track_reference': init_reference_out[:, num_dts:],
+        }
 
 class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -492,6 +584,189 @@ class DeformableTransformerDecoder(nn.Module):
             return torch.stack(intermediate), torch.stack(intermediate_reference_points)
 
         return output, reference_points
+    
+
+class CrossAttentionDecoder(nn.Module):
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+        super().__init__()
+        self.tgt1_layers = _get_clones(decoder_layer, num_layers)
+        self.tgt2_layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+        self.box_embed = None
+
+    def forward(self, tgt1, tgt2,
+                tgt1_mask: Optional[Tensor] = None,
+                tgt2_mask: Optional[Tensor] = None,
+                tgt1_key_padding_mask: Optional[Tensor] = None,
+                tgt2_key_padding_mask: Optional[Tensor] = None,
+                tgt1_reference_points: Optional[Tensor] = None,
+                tgt2_reference_points: Optional[Tensor] = None,
+                num_tgt1: Optional[int] = None,
+                num_tgt2: Optional[int] = None,
+                pos1: Optional[Tensor] = None,
+                pos2: Optional[Tensor] = None):
+
+        output1 = tgt1
+        output2 = tgt2
+
+        intermediate1 = []
+        intermediate2 = []
+
+        intermediate1_reference_points = []
+        intermediate2_reference_points = []
+
+        for lid in range(self.num_layers):
+            layer_tgt1 = self.tgt1_layers[lid]
+            layer_tgt2 = self.tgt2_layers[lid]
+            # Init pos embedding
+            pe1 = pos2posemb(tgt1_reference_points)
+            pe2 = pos2posemb(tgt2_reference_points)
+
+            if pos1 is not None:
+                cross_pos1 = pe1 + pos1
+            else:
+                cross_pos1 = pe1
+            if pos2 is not None:
+                cross_pos2 = pe2 + pos2         
+            else:
+                cross_pos2 = pe2
+
+            new_output1 = layer_tgt1(output1[:, :num_tgt1].transpose(0, 1)
+                                     , output2.transpose(0, 1), tgt1_mask, tgt2_mask,
+                                    tgt1_key_padding_mask, tgt2_key_padding_mask, cross_pos2.transpose(0, 1), pe1[:, :num_tgt1].transpose(0, 1))
+            new_output2 = layer_tgt2(output2[:, :num_tgt2].transpose(0, 1), output1.transpose(0, 1), tgt2_mask, tgt1_mask,
+                                tgt2_key_padding_mask, tgt1_key_padding_mask, cross_pos1.transpose(0, 1), pe2[:, :num_tgt2].transpose(0, 1))
+            
+            output1[:, :num_tgt1] = new_output1.transpose(0, 1)
+            output2[:, :num_tgt2] = new_output2.transpose(0, 1)
+            
+            if self.box_embed is not None:
+                if tgt1_reference_points.shape[-1] == 4:
+                    new_reference_points1 = self.box_embed[lid](output1) + inverse_sigmoid(tgt1_reference_points)
+                    new_reference_points1 = new_reference_points1.sigmoid()
+                else:
+                    assert tgt1_reference_points.shape[-1] == 2
+                    new_reference_points1 = self.box_embed[lid](output1)
+                    new_reference_points1[..., :2] = self.box_embed[lid](output1)[..., :2] + inverse_sigmoid(tgt1_reference_points)
+                    new_reference_points1 = new_reference_points1.sigmoid()
+                tgt1_reference_points = new_reference_points1.detach()
+
+                if tgt2_reference_points.shape[-1] == 4:
+                    new_reference_points2 = self.box_embed[lid](output2) + inverse_sigmoid(tgt2_reference_points)
+                    new_reference_points2 = new_reference_points2.sigmoid()
+                else:
+                    assert tgt2_reference_points.shape[-1] == 2
+                    new_reference_points2 = self.box_embed[lid](output2)
+                    new_reference_points2[..., :2] = self.box_embed[lid](output2)[..., :2] + inverse_sigmoid(tgt2_reference_points)
+                    new_reference_points2 = new_reference_points2.sigmoid()
+                tgt2_reference_points = new_reference_points2.detach()
+
+            if self.return_intermediate:
+                intermediate1.append(output1)
+                intermediate2.append(output2)
+
+                intermediate1_reference_points.append(tgt1_reference_points)
+                intermediate2_reference_points.append(tgt2_reference_points)
+
+        if self.norm is not None:
+            output1 = self.norm(output1)
+            output2 = self.norm(output2)
+            if self.return_intermediate:
+                intermediate1[-1] = output1
+                intermediate2[-1] = output2
+
+        if self.return_intermediate:
+            return torch.stack(intermediate1), torch.stack(intermediate2), torch.stack(intermediate1_reference_points), torch.stack(intermediate2_reference_points)
+
+        return output1, output2, tgt1_reference_points, tgt2_reference_points
+
+class TransformerDecoderLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, tgt, memory,
+                     tgt_mask: Optional[Tensor] = None,
+                     memory_mask: Optional[Tensor] = None,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None):
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def forward_pre(self, tgt, memory,
+                    tgt_mask: Optional[Tensor] = None,
+                    memory_mask: Optional[Tensor] = None,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None):
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        if self.normalize_before:
+            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+        
+
 
 
 def _get_clones(module, N):
@@ -515,6 +790,8 @@ def build_deforamble_transformer(args):
         nhead=args.nheads,
         num_encoder_layers=args.enc_layers,
         num_decoder_layers=args.dec_layers,
+        num_ps_new_born=args.num_ps_new_born,
+        num_cross_attn_layers=args.cross_attn_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
         activation="relu",

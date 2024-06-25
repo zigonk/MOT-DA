@@ -79,6 +79,9 @@ def get_args_parser():
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
+    parser.add_argument('--cross_attn_layers', default=2, type=int,
+                        help="Number of cross attention layers")
+    parser.add_argument('--num_ps_new_born', default=20, type=int,)
     parser.add_argument('--dim_feedforward', default=1024, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
