@@ -1,62 +1,62 @@
-#!/usr/bin/env bash
-# ------------------------------------------------------------------------
-# Copyright (c) 2022 megvii-research. All Rights Reserved.
-# ------------------------------------------------------------------------
+# #!/usr/bin/env bash
+# # ------------------------------------------------------------------------
+# # Copyright (c) 2022 megvii-research. All Rights Reserved.
+# # ------------------------------------------------------------------------
 
 
-set -x
+# set -x
 
-PY_ARGS=${@:2}
+# PY_ARGS=${@:2}
 
-set -o pipefail
+# set -o pipefail
 
 # export NCCL_SOCKET_IFNAME=eno1
-# export NCCL_DEBUG=INFO
+# # export NCCL_DEBUG=INFO
 
-OUTPUT_BASE=$(echo $1 | sed -e "s/configs/exps/g" | sed -e "s/.args$//g")
-mkdir -p $OUTPUT_BASE
+# OUTPUT_BASE=$(echo $1 | sed -e "s/configs/exps/g" | sed -e "s/.args$//g")
+# mkdir -p $OUTPUT_BASE
 
-for RUN in $(seq 100); do
-  ls $OUTPUT_BASE | grep run$RUN && continue
-  OUTPUT_DIR=$OUTPUT_BASE/run$RUN
-  mkdir $OUTPUT_DIR && break
-done
-# OUTPUT_DIR=$OUTPUT_BASE/run4
-# mkdir $OUTPUT_DIR && break
-# clean up *.pyc files
-rmpyc() {
-  rm -rf $(find -name __pycache__)
-  rm -rf $(find -name "*.pyc")
-}
+# for RUN in $(seq 100); do
+#   ls $OUTPUT_BASE | grep run$RUN && continue
+#   OUTPUT_DIR=$OUTPUT_BASE/run$RUN
+#   mkdir $OUTPUT_DIR && break
+# done
+# # OUTPUT_DIR=$OUTPUT_BASE/run4
+# # mkdir $OUTPUT_DIR && break
+# # clean up *.pyc files
+# rmpyc() {
+#   rm -rf $(find -name __pycache__)
+#   rm -rf $(find -name "*.pyc")
+# }
 
-# run backup
-echo "Backing up to log dir: $OUTPUT_DIR"
-rmpyc && cp -r models datasets util main.py engine.py submit_dance.py $1 $OUTPUT_DIR
-echo " ...Done"
+# # run backup
+# echo "Backing up to log dir: $OUTPUT_DIR"
+# rmpyc && cp -r models datasets util main.py engine.py submit_dance.py $1 $OUTPUT_DIR
+# echo " ...Done"
 
-# tar src to avoid future editing
-cleanup() {
-  echo "Packing source code"
-  rmpyc
-  # tar -zcf models datasets util main.py engine.py eval.py submit.py --remove-files
-  echo " ...Done"
-}
+# # tar src to avoid future editing
+# cleanup() {
+#   echo "Packing source code"
+#   rmpyc
+#   # tar -zcf models datasets util main.py engine.py eval.py submit.py --remove-files
+#   echo " ...Done"
+# }
 
 args=$(cat $1)
 
-pushd $OUTPUT_DIR
-trap cleanup EXIT
+# pushd $OUTPUT_DIR
+# trap cleanup EXIT
 
-# log git status
-echo "Logging git status"
-git status > git_status
-git rev-parse HEAD > git_tag
-git diff > git_diff
-echo $PY_ARGS > desc
-echo " ...Done"
+# # log git status
+# echo "Logging git status"
+# git status > git_status
+# git rev-parse HEAD > git_tag
+# git diff > git_diff
+# echo $PY_ARGS > desc
+# echo " ...Done"
 
 python -m torch.distributed.launch \
-  --nproc_per_node=2 --use_env \
-  --nnodes=1 --node_rank=0 \
-  --master_addr=10.8.9.1 --master_port=1234 \
+  --nproc_per_node=1 --use_env \
   main.py ${args} --output_dir . |& tee -a output.log
+  # --nnodes=1 --node_rank=0 \
+  # --master_addr=10.8.9.1 --master_port=1234 \

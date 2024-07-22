@@ -192,17 +192,19 @@ class ClipMatcher(SetCriterion):
         gt_instances_i = self.gt_instances[self._current_frame_idx]
         track_instances: Instances = outputs_without_aux['track_instances']
         # predicted logits of i-th image.
+        pred_class_logits_i = track_instances.pred_class_logits
+        pred_nb_logits_i = track_instances.pred_nb_logits
         pred_logits_i = track_instances.pred_logits
         # predicted boxes of i-th image.
         pred_boxes_i = track_instances.pred_boxes
 
         obj_idxes = gt_instances_i.obj_ids
         outputs_i = {
+            'pred_class_logits': pred_class_logits_i.unsqueeze(0),
+            'pred_nb_logits': pred_nb_logits_i.unsqueeze(0),
             'pred_logits': pred_logits_i.unsqueeze(0),
-            'pred_nb_logits': track_instances.pred_nb_logits.unsqueeze(0),
             'pred_boxes': pred_boxes_i.unsqueeze(0),
         }
-
         # step1. inherit and update the previous tracks.
         num_disappear_track = 0
         track_instances.matched_gt_idxes[:] = -1
@@ -245,6 +247,7 @@ class ClipMatcher(SetCriterion):
         # step4. do matching between the unmatched slots and GTs.
         unmatched_outputs = {
             'pred_logits': track_instances.pred_logits[unmatched_track_idxes].unsqueeze(0),
+            'pred_class_logits': track_instances.pred_class_logits[unmatched_track_idxes].unsqueeze(0),
             'pred_nb_logits': track_instances.pred_nb_logits[unmatched_track_idxes].unsqueeze(0),
             'pred_boxes': track_instances.pred_boxes[unmatched_track_idxes].unsqueeze(0),
         }
@@ -289,6 +292,7 @@ class ClipMatcher(SetCriterion):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 unmatched_outputs_layer = {
                     'pred_logits': aux_outputs['pred_logits'][0, unmatched_track_idxes].unsqueeze(0),
+                    'pred_class_logits': aux_outputs['pred_class_logits'][0, unmatched_track_idxes].unsqueeze(0),
                     'pred_nb_logits': aux_outputs['pred_nb_logits'][0, unmatched_track_idxes].unsqueeze(0),
                     'pred_boxes': aux_outputs['pred_boxes'][0, unmatched_track_idxes].unsqueeze(0),
                 }
@@ -550,8 +554,10 @@ class MOTR(nn.Module):
             (len(track_instances), 4), dtype=torch.float, device=device)
         track_instances.pred_class_logits = torch.zeros(
             (len(track_instances), self.num_classes), dtype=torch.float, device=device)
-        track_instances.pred_class_logits_nb = torch.zeros(
+        track_instances.pred_nb_logits = torch.zeros(
             (len(track_instances), 1), dtype=torch.float, device=device)
+        track_instances.pred_logits = torch.zeros(
+            (len(track_instances), self.num_classes), dtype=torch.float, device=device)
 
         track_instances.frame_idx = torch.zeros(
             (len(track_instances),), dtype=torch.long, device=device)
@@ -594,8 +600,6 @@ class MOTR(nn.Module):
         outputs_classes = []
         outputs_classes_nb = []
         outputs_coords = []
-        print("Log shape")
-        print(hs.shape, cross_hs.shape)
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
@@ -613,8 +617,6 @@ class MOTR(nn.Module):
                 tmp = self.detection_bbox_embed[lvl](hs[lvl])
             else:
                 tmp = self.track_bbox_embed[lvl](hs[lvl])
-            
-            print(reference.shape, tmp.shape)
 
             if reference.shape[-1] == 4:
                 tmp += reference
@@ -651,7 +653,7 @@ class MOTR(nn.Module):
         return torch.stack(outputs_classes), torch.stack(outputs_classes_nb), torch.stack(outputs_coords)
         
 
-    def _forward_single_image(self, samples, track_instances: Instances, gtboxes=None):
+    def _forward_single_image(self, samples, track_instances: Instances, gtboxes=None, num_dts=0):
         features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -691,8 +693,8 @@ class MOTR(nn.Module):
             query_embed = track_instances.query_pos
             ref_pts = track_instances.ref_pts
             attn_mask = None
-
-        num_dts = torch.sum(track_instances.obj_idxes == -1)
+        
+        # print("Num dts:", num_dts)
         dec_outputs = \
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
                              mem_bank=track_instances.mem_bank, 
@@ -710,8 +712,6 @@ class MOTR(nn.Module):
                                                             dec_outputs['cross_hs_track'],
                                                             dec_outputs['cross_inter_track_references'],
                                                             dec_outputs['init_track_reference'], is_predict_new_born=False)
-        
-
 
         out = {'track_outputs': track_outputs, 'detect_outputs': detect_outputs}
         if self.aux_loss:
@@ -726,6 +726,7 @@ class MOTR(nn.Module):
         out['cross_hs_track'] = dec_outputs['cross_hs_track']
         out['pred_class_logits'] = torch.cat([out['detect_outputs'][0], out['track_outputs'][0]], dim=2)
         out['pred_nb_logits'] = torch.cat([out['detect_outputs'][1], out['track_outputs'][1]], dim=2)
+        out['pred_logits'] = out['pred_class_logits'] * out['pred_nb_logits']
         out['pred_boxes'] = torch.cat([out['detect_outputs'][2], out['track_outputs'][2]], dim=2)
         out['hs'] = torch.cat([out['hs_detect'], out['hs_track']], dim=2)
         out['cross_hs'] = torch.cat([out['cross_hs_detect'], out['cross_hs_track']], dim=2)
@@ -760,23 +761,27 @@ class MOTR(nn.Module):
         # else:
         assert self.query_denoise == 0, "Not implemented yet."
 
-        print(frame_res['pred_class_logits'].shape)
-        print(frame_res['pred_nb_logits'].shape)
+        # print(frame_res['pred_class_logits'].shape)
+        # print(frame_res['pred_nb_logits'].shape)
 
         with torch.no_grad():
             if self.training:
                 # track_scores = frame_res['pred_logits'][0, :].sigmoid().max(
                 #     dim=-1).values
-                track_scores = frame_res['pred_class_logits'][0, 0, :].sigmoid() * frame_res['pred_nb_logits'][0, :].sigmoid()
+                track_scores = frame_res['pred_class_logits'][-1, 0, :].sigmoid().max(dim=-1).values * frame_res['pred_nb_logits'][-1, 0, :].sigmoid().max(dim=-1).values
             else:
-                track_scores = frame_res['pred_class_logits'][0, :, 0].sigmoid()
+                track_scores = frame_res['pred_class_logits'][-1, :, 0].sigmoid()
+        # print("Track score shape:", track_scores.shape)
+        # print(frame_res['pred_class_logits'][-1, 0, :].sigmoid().max(dim=-1).values.shape)
+        # print(frame_res['pred_nb_logits'][-1, 0, :].sigmoid().shape)
         # print("Track_scores with previous query")
         # print(track_scores > 0.5)
         track_instances.scores = track_scores
-        track_instances.pred_logits = frame_res['pred_class_logits'][0]
-        track_instances.pred_nb_logits = frame_res['pred_nb_logits'][0]
-        track_instances.pred_boxes = frame_res['pred_boxes'][0]
-        track_instances.output_embedding = frame_res['hs'][0]
+        track_instances.pred_logits = frame_res['pred_class_logits'][-1][0] * frame_res['pred_nb_logits'][-1][0]
+        track_instances.pred_class_logits = frame_res['pred_class_logits'][-1][0]
+        track_instances.pred_nb_logits = frame_res['pred_nb_logits'][-1][0]
+        track_instances.pred_boxes = frame_res['pred_boxes'][-1][0]
+        track_instances.output_embedding = frame_res['hs'][-1][0]
         # track_instances.frame_idx += 1
         # track_instances.accum_dist += frame_res['mov_dist'][0]
         # track_instances.accum_deform += frame_res['deform'][0]
@@ -878,6 +883,7 @@ class MOTR(nn.Module):
         for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
             frame.requires_grad = False
             is_last = frame_index == len(frames) - 1
+            # print(len(proposals))
 
             if self.query_denoise > 0:
                 l_1 = l_2 = self.query_denoise
@@ -890,24 +896,28 @@ class MOTR(nn.Module):
 
             if track_instances is None:
                 track_instances = self._generate_empty_tracks(proposals)
+                num_dts = len(track_instances)
             else:
                 if self.motion_prediction is not None:
                     track_instances = self.motion_prediction(track_instances)
                 if self.training:
                     random_select_instances = torch.rand(len(track_instances)) < self.random_drop_rate
                     track_instances = track_instances[~random_select_instances]
+                new_track_instances = self._generate_empty_tracks(proposals)
+                num_dts = len(new_track_instances)
                 track_instances = Instances.cat([
-                    self._generate_empty_tracks(proposals),
+                    new_track_instances,
                     track_instances])
 
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, gtboxes, *args):
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, tmp, gtboxes, num_dts=num_dts) 
                     return (
                         frame_res['pred_class_logits'],
                         frame_res['pred_nb_logits'],
+                        frame_res['pred_logits'],
                         frame_res['pred_boxes'],
                         frame_res['hs'],
                         frame_res['cross_hs'],
@@ -927,9 +937,10 @@ class MOTR(nn.Module):
                 frame_res = {
                     'pred_class_logits': tmp[0],
                     'pred_nb_logits': tmp[1],
-                    'pred_boxes': tmp[2],
-                    'hs': tmp[3],
-                    'cross_hs': tmp[4],
+                    'pred_logits': tmp[2],
+                    'pred_boxes': tmp[3],
+                    'hs': tmp[4],
+                    'cross_hs': tmp[5],
                     # 'aux_outputs': [{
                     #     'pred_class_logits': tmp[5 + i],
                     #     'pred_nb_logits': tmp[5 + len(args) + i],
@@ -939,7 +950,7 @@ class MOTR(nn.Module):
             else:
                 frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(
-                    frame, track_instances, gtboxes)
+                    frame, track_instances, gtboxes, num_dts=num_dts)
             frame_res = self._post_process_single_image(
                 frame_res, track_instances, is_last)
 

@@ -61,6 +61,7 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
             sys.exit(1)
 
         optimizer.zero_grad()
+        torch.autograd.set_detect_anomaly(True)
         losses.backward()
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)

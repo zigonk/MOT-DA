@@ -191,42 +191,11 @@ class DeformableTransformer(nn.Module):
 
         # prepare input for decoder
         bs, _, c = memory.shape
-        # if self.two_stage:
-        #     output_memory, output_proposals = self.gen_encoder_output_proposals(
-        #         memory, mask_flatten, spatial_shapes)
 
-        #     # hack implementation for two-stage Deformable DETR
-        #     enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](
-        #         output_memory)
-        #     enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](
-        #         output_memory) + output_proposals
-
-        #     topk = self.two_stage_num_proposals
-        #     topk_proposals = torch.topk(
-        #         enc_outputs_class[..., 0], topk, dim=1)[1]
-        #     topk_coords_unact = torch.gather(
-        #         enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
-        #     topk_coords_unact = topk_coords_unact.detach()
-        #     reference_points = topk_coords_unact.sigmoid()
-        #     init_reference_out = reference_points
-        #     pos_trans_out = self.pos_trans_norm(self.pos_trans(
-        #         self.get_proposal_pos_embed(topk_coords_unact)))
-        #     query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
-        # else:
         tgt = query_embed.unsqueeze(0).expand(bs, -1, -1)
         reference_points = ref_pts.unsqueeze(0).expand(bs, -1, -1)
         init_reference_out = reference_points
 
-        # # Update tgt by averaging the mem_bank
-        # if mem_bank is not None:
-        #     avg_mem_bank = mem_bank * (~mem_bank_pad_mask.unsqueeze(-1))
-        #     avg_mem_bank = avg_mem_bank.sum(
-        #         1) / (~mem_bank_pad_mask).sum(1).unsqueeze(-1)
-        #     new_tgt = (tgt + avg_mem_bank) / 2.
-        #     is_exist_mem = (~mem_bank_pad_mask).any(1)
-        #     print(is_exist_mem.sum())
-        #     tgt = torch.where(is_exist_mem.unsqueeze(-1), new_tgt, tgt)
-        # decoder
         detect_tgt, detect_reference_points = tgt[:, :num_dts], reference_points[:, :num_dts]
         track_tgt, track_reference_points = tgt[:, num_dts:], reference_points[:, num_dts:]
         
@@ -269,26 +238,23 @@ class DeformableTransformer(nn.Module):
 
         # Remove the first token
         if self.return_intermediate_dec:
-            hs_detect = hs_detect[:,:, 1:]
-            hs_track = hs_track[:,:, 1:]
-            inter_detect_references = inter_detect_references[:,:, 1:]
-            inter_track_references = inter_track_references[:,:, 1:]
-            cross_hs_detect = cross_hs_detect[:,:, 1:]
-            cross_hs_track = cross_hs_track[:,:, 1:hs_track.shape[2]]
+            hs_detect = hs_detect[:, :, 1:]
+            hs_track = hs_track[:, :, 1:]
+            inter_detect_references = inter_detect_references[:, :, 1:]
+            inter_track_references = inter_track_references[:, :, 1:]
+            cross_hs_detect = cross_hs_detect[:, :, 1:]
+            cross_hs_track = cross_hs_track[:, :, 1:hs_track.shape[2] + 1]
             cross_inter_detect_references = cross_inter_detect_references[:,:, 1:]
-            cross_inter_track_references = cross_inter_track_references[:,:, 1:hs_track.shape[2]]
+            cross_inter_track_references = cross_inter_track_references[:,:, 1:hs_track.shape[2] + 1]
         else:
             hs_detect = hs_detect[:, 1:]
             hs_track = hs_track[:, 1:]
             inter_detect_references = inter_detect_references[:, 1:]
             inter_track_references = inter_track_references[:, 1:]
             cross_hs_detect = cross_hs_detect[:, 1:]
-            cross_hs_track = cross_hs_track[:, 1:]
+            cross_hs_track = cross_hs_track[:, 1:hs_track.shape[1] + 1]
             cross_inter_detect_references = cross_inter_detect_references[:, 1:]
-            cross_inter_track_references = cross_inter_track_references[:, 1:]
-
-        print(hs_detect.shape, hs_track.shape, inter_detect_references.shape, inter_track_references.shape, cross_hs_detect.shape, cross_hs_track.shape, cross_inter_detect_references.shape, cross_inter_track_references.shape)
-
+            cross_inter_track_references = cross_inter_track_references[:, 1:hs_track.shape[1] + 1]
 
         # hs, inter_references = self.track_decoder(tgt, reference_points, memory,
         #                                     spatial_shapes, level_start_index,
@@ -639,8 +605,8 @@ class CrossAttentionDecoder(nn.Module):
             new_output2 = layer_tgt2(output2[:, :num_tgt2].transpose(0, 1), output1.transpose(0, 1), tgt2_mask, tgt1_mask,
                                 tgt2_key_padding_mask, tgt1_key_padding_mask, cross_pos1.transpose(0, 1), pe2[:, :num_tgt2].transpose(0, 1))
             
-            output1[:, :num_tgt1] = new_output1.transpose(0, 1)
-            output2[:, :num_tgt2] = new_output2.transpose(0, 1)
+            output1 = torch.cat([new_output1.transpose(0, 1), output1[:, num_tgt1:]], dim=1)
+            output2 = torch.cat([new_output2.transpose(0, 1), output2[:, num_tgt2:]], dim=1)
             
             if self.box_embed is not None:
                 if tgt1_reference_points.shape[-1] == 4:
